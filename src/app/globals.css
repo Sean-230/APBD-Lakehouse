@@ -1,0 +1,85 @@
+@import "tailwindcss";
+
+:root {
+  --ground: #f4f7f5;
+  --surface: #ffffff;
+  --raised: #f4f6f8;
+  --active: #e6ece8;
+  --border: #e6e9e7;
+  --rule: #f0f2f1;
+  --control: #cdced1;
+  --text: #131416;
+  --muted: #585c5a;
+  --faint: #666a68;
+  --accent: #166553;
+  --primary: #131416;
+  --primary-ink: #ffffff;
+  --positive: #1e7b4f;
+  --negative: #c4242a;
+  --warning: #92400e;
+  --chart-1: #166553;
+  --chart-2: #2f70bb;
+  --chart-3: #a86f0c;
+  --pill-positive-bg: #dcfae5;
+  --pill-positive-ink: #04250e;
+  --pill-negative-bg: #ffedea;
+  --pill-negative-ink: #831c1e;
+  --pill-warning-bg: #fffbeb;
+  --pill-warning-ink: #92400e;
+  --pill-neutral-bg: #ebedee;
+  --pill-neutral-ink: #353736;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--text);
+  font-family: var(--font-plex-sans), system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 20px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-mono-code {
+  font-family: var(--font-plex-mono), ui-monospace, SFMono-Regular, monospace;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Framed-sheet L-frame shell */
+.framed-shell {
+  display: grid;
+  grid-template-columns: 228px minmax(0, 1fr);
+  grid-template-rows: 48px minmax(0, 1fr);
+  min-height: 100svh;
+  background: var(--ground);
+}
+
+.framed-sheet {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  margin: 0 8px 8px 0;
+  padding: 24px;
+  min-width: 0;
+}
+
+@media (max-width: 768px) {
+  .framed-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: 48px 1fr;
+  }
+  .framed-sheet {
+    margin: 0;
+    border-radius: 0;
+    border-left: 0;
+    border-right: 0;
+    padding: 16px;
+  }
+}

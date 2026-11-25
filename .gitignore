@@ -1,0 +1,18 @@
+# Design inspection scratch files
+.taste-skill/
+
+# OS & Editor
+.DS_Store
+
+# Python / Lakehouse local artifacts
+.venv/
+__pycache__/
+*.pyc
+warehouse/
+*.db
+
+# Node / Next.js
+node_modules/
+.next/
+.env
+.env.local
