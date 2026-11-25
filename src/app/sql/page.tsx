@@ -1,124 +1,80 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useState } from "react";
 import { useLakehouse } from "@/components/LakehouseContext";
-import type { IcebergSnapshot } from "@/lib/lakehouse-data";
+import { executeSql, saveSqlAsGold, type SqlResponse } from "@/lib/api";
 
-interface QueryResult {
-  elapsedMs: number;
-  columns: string[];
-  numericCols: Set<string>;
-  rows: string[][];
-}
-
-interface SqlPreset {
-  id: string;
-  label: string;
-  sql: string;
-  run: (snap: IcebergSnapshot, allSnaps: IcebergSnapshot[]) => QueryResult;
-}
-
-const PRESETS: SqlPreset[] = [
+const PRESETS = [
   {
-    id: "lagging",
-    label: "OPD Serapan < 70%",
-    sql: `SELECT kode_opd, nama_opd, pagu_miliar, realisasi_miliar,
-       ROUND(realisasi_miliar / pagu_miliar * 100, 1) AS serapan_pct
-FROM iceberg_scan('warehouse/gold/apbd_opd_summary')
-WHERE (realisasi_miliar / pagu_miliar * 100) < 70.0
-ORDER BY serapan_pct ASC;`,
-    run: (snap) => {
-      const rows = snap.opd
-        .map((o) => ({ ...o, serapan: +((o.realisasiM / o.paguM) * 100).toFixed(1) }))
-        .filter((o) => o.serapan < 70.0)
-        .sort((a, b) => a.serapan - b.serapan);
-      return {
-        elapsedMs: 14,
-        columns: ["kode_opd", "nama_opd", "pagu_miliar", "realisasi_miliar", "serapan_pct"],
-        numericCols: new Set(["pagu_miliar", "realisasi_miliar", "serapan_pct"]),
-        rows: rows.map((r) => [
-          r.kode,
-          r.nama,
-          `Rp ${r.paguM.toLocaleString("id-ID")} M`,
-          `Rp ${r.realisasiM.toLocaleString("id-ID")} M`,
-          `${r.serapan.toFixed(1).replace(".", ",")}%`,
-        ]),
-      };
-    },
+    label: "Top 10 OPD Alokasi Terbesar",
+    sql: `SELECT nama_opd, alokasi_rp, sp2d_rp, serapan_sp2d_pct, jumlah_anomali
+FROM gold.apbd_opd_summary
+ORDER BY alokasi_rp DESC
+LIMIT 10;`,
   },
   {
-    id: "timetravel",
-    label: "Time-Travel: Murni vs PAK",
-    sql: `SELECT p.nama_opd,
-       m.pagu_miliar AS pagu_murni,
-       p.pagu_miliar AS pagu_pak,
-       (p.pagu_miliar - m.pagu_miliar) AS selisih_miliar
-FROM iceberg_scan('warehouse/gold/apbd_opd_summary', snapshot => 'snap_94a8f10c') p
-JOIN iceberg_scan('warehouse/gold/apbd_opd_summary', snapshot => 'snap_40e19a88') m
-  USING (kode_opd)
-ORDER BY selisih_miliar DESC
-LIMIT 6;`,
-    run: (_snap, allSnaps) => {
-      const pak = allSnaps[0].opd;
-      const murni = allSnaps[2].opd;
-      const joined = pak
-        .map((p) => {
-          const m = murni.find((x) => x.kode === p.kode)!;
-          return { nama: p.nama, murni: m.paguM, pak: p.paguM, diff: p.paguM - m.paguM };
-        })
-        .sort((a, b) => b.diff - a.diff)
-        .slice(0, 6);
-      return {
-        elapsedMs: 21,
-        columns: ["nama_opd", "pagu_murni", "pagu_pak", "selisih_miliar"],
-        numericCols: new Set(["pagu_murni", "pagu_pak", "selisih_miliar"]),
-        rows: joined.map((r) => [
-          r.nama,
-          `Rp ${r.murni.toLocaleString("id-ID")} M`,
-          `Rp ${r.pak.toLocaleString("id-ID")} M`,
-          `+Rp ${r.diff.toLocaleString("id-ID")} M`,
-        ]),
-      };
-    },
+    label: "Cek Anomali Fisik > 100%",
+    sql: `SELECT nama_opd, kode_sub_kegiatan, nama_pekerjaan, rencana_fisik_pct, dq_flag
+FROM gold.dq_anomaly_audit
+LIMIT 20;`,
   },
   {
-    id: "top5",
-    label: "Top 5 Pagu Terbesar",
-    sql: `SELECT kode_opd, nama_opd, urusan, pagu_miliar, sub_kegiatan
-FROM iceberg_scan('warehouse/gold/apbd_opd_summary')
-ORDER BY pagu_miliar DESC
-LIMIT 5;`,
-    run: (snap) => {
-      const rows = [...snap.opd].sort((a, b) => b.paguM - a.paguM).slice(0, 5);
-      return {
-        elapsedMs: 11,
-        columns: ["kode_opd", "nama_opd", "urusan", "pagu_miliar", "sub_kegiatan"],
-        numericCols: new Set(["pagu_miliar", "sub_kegiatan"]),
-        rows: rows.map((r) => [
-          r.kode,
-          r.nama,
-          r.urusan,
-          `Rp ${r.paguM.toLocaleString("id-ID")} M`,
-          r.subKegiatan.toLocaleString("id-ID"),
-        ]),
-      };
-    },
+    label: "JOIN Monitoring × eBudgeting",
+    sql: `SELECT m.nama_opd, m.kode_sub_kegiatan,
+       COUNT(DISTINCT m.id_pekerjaan) AS paket_monitoring,
+       COUNT(e.nama_komponen) AS komponen_ebudgeting
+FROM silver.monitoring_pekerjaan m
+JOIN silver.ebudgeting_rincian e
+  USING (kode_sub_kegiatan)
+GROUP BY 1, 2
+LIMIT 15;`,
   },
 ];
 
 export default function SqlExplorerPage() {
-  const { snapshots, currentSnapshot } = useLakehouse();
-  const [presetId, setPresetId] = useState(PRESETS[0].id);
+  const { catalog, refreshAll } = useLakehouse();
   const [sqlText, setSqlText] = useState(PRESETS[0].sql);
-  const [runVersion, setRunVersion] = useState(0);
+  const [result, setResult] = useState<SqlResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const [goldName, setGoldName] = useState("custom_summary");
+  const [savingGold, setSavingGold] = useState(false);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
 
-  const result = useMemo(() => {
-    void runVersion;
-    const preset = PRESETS.find((p) => p.id === presetId) ?? PRESETS[0];
-    return preset.run(currentSnapshot, snapshots);
-  }, [presetId, currentSnapshot, snapshots, runVersion]);
+  const handleSaveGold = async () => {
+    if (!goldName.trim()) return;
+    setSavingGold(true);
+    setError(null);
+    setSaveNotice(null);
+    try {
+      const res = await saveSqlAsGold(sqlText, goldName.trim());
+      setSaveNotice(
+        `Tersimpan ke ${res.table} (${res.rows.toLocaleString("id-ID")} baris · snapshot ${res.snapshot_id})`
+      );
+      await refreshAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingGold(false);
+    }
+  };
+
+  const handleRun = async () => {
+    setRunning(true);
+    setError(null);
+    try {
+      const res = await executeSql(sqlText);
+      setResult(res);
+    } catch (err) {
+      setResult(null);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRunning(false);
+    }
+  };
 
   const exportCsv = () => {
+    if (!result) return;
     const csv = [
       result.columns.join(","),
       ...result.rows.map((r) =>
@@ -129,7 +85,7 @@ export default function SqlExplorerPage() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `suralake_${presetId}_${currentSnapshot.id}.csv`;
+    a.download = `suralake_query.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -142,24 +98,25 @@ export default function SqlExplorerPage() {
             SQL Explorer (DuckDB + Iceberg)
           </h1>
           <p className="mt-1 text-[14px] text-[var(--muted)]">
-            Jalankan query analitik langsung ke file Parquet Apache Iceberg tanpa
-            migrasi ke database relasional terpisah.
+            Eksekusi SQL baca (SELECT / WITH) langsung ke tabel Apache Iceberg yang terdaftar ({catalog.tables.length} tabel aktif).
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
+            disabled={!result}
             onClick={exportCsv}
-            className="inline-flex items-center h-8 px-3 rounded-md border border-[var(--control)] bg-white text-[13px] font-medium hover:bg-[var(--raised)] cursor-pointer"
+            className="inline-flex items-center h-8 px-3 rounded-md border border-[var(--control)] bg-white text-[13px] font-medium hover:bg-[var(--raised)] disabled:opacity-50 cursor-pointer"
           >
             Export CSV
           </button>
           <button
             type="button"
-            onClick={() => setRunVersion((v) => v + 1)}
-            className="inline-flex items-center h-8 px-3 rounded-md bg-[var(--primary)] text-[var(--primary-ink)] text-[13px] font-medium hover:bg-[#2a2d30] cursor-pointer"
+            disabled={running}
+            onClick={handleRun}
+            className="inline-flex items-center h-8 px-3 rounded-md bg-[var(--primary)] text-[var(--primary-ink)] text-[13px] font-medium hover:bg-[#2a2d30] disabled:opacity-60 cursor-pointer"
           >
-            Jalankan Query
+            {running ? "Menjalankan..." : "Jalankan Query"}
           </button>
         </div>
       </div>
@@ -168,23 +125,16 @@ export default function SqlExplorerPage() {
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-[16px] font-semibold">Query Editor</h2>
           <span className="font-mono-code text-[12px] text-[var(--faint)]">
-            Snapshot aktif: {currentSnapshot.id}
+            Engine: DuckDB · PyIceberg
           </span>
         </div>
         <div className="flex flex-wrap gap-2 mb-3">
           {PRESETS.map((p) => (
             <button
-              key={p.id}
+              key={p.label}
               type="button"
-              onClick={() => {
-                setPresetId(p.id);
-                setSqlText(p.sql);
-              }}
-              className={`h-7 px-2.5 rounded-md border text-[12px] cursor-pointer ${
-                presetId === p.id
-                  ? "border-[var(--accent)] bg-[#f2f8f6] text-[var(--text)] font-medium"
-                  : "border-[var(--border)] bg-white text-[var(--muted)] hover:border-[var(--accent)]"
-              }`}
+              onClick={() => setSqlText(p.sql)}
+              className="h-7 px-2.5 rounded-md border border-[var(--border)] bg-white text-[12px] text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--text)] cursor-pointer"
             >
               {p.label}
             </button>
@@ -197,68 +147,88 @@ export default function SqlExplorerPage() {
           aria-label="Editor SQL DuckDB"
           className="w-full min-h-[132px] p-3.5 rounded-md border border-[var(--border)] bg-[var(--ground)] font-mono-code text-[13px] leading-5 text-[var(--text)] resize-y focus:outline-none focus:border-[var(--accent)]"
         />
+        <div className="mt-3 pt-3 border-t border-[var(--rule)] flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="font-mono-code text-[12px] text-[var(--faint)]">gold.</span>
+            <input
+              type="text"
+              value={goldName}
+              onChange={(e) => setGoldName(e.target.value)}
+              placeholder="nama_tabel_gold"
+              className="h-8 px-2.5 rounded-md border border-[var(--control)] bg-white font-mono-code text-[13px] w-48"
+            />
+            <button
+              type="button"
+              disabled={savingGold || !goldName.trim()}
+              onClick={handleSaveGold}
+              className="inline-flex items-center h-8 px-3 rounded-md border border-[var(--control)] bg-white text-[13px] font-medium hover:bg-[var(--raised)] disabled:opacity-50 cursor-pointer"
+            >
+              {savingGold ? "Menyimpan..." : "Simpan sebagai Tabel Gold"}
+            </button>
+          </div>
+          {saveNotice && (
+            <span className="text-[12px] font-medium text-[var(--accent)]">{saveNotice}</span>
+          )}
+        </div>
       </section>
 
       <section className="bg-white border border-[var(--border)] rounded-lg p-5">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-[16px] font-semibold">Hasil Query</h2>
-          <span className="font-mono-code text-[12px] text-[var(--faint)]">
-            {result.rows.length} baris · {result.elapsedMs} ms (DuckDB local)
-          </span>
+          {result && (
+            <span className="font-mono-code text-[12px] text-[var(--faint)]">
+              {result.rowCount} baris · {result.elapsedMs} ms
+            </span>
+          )}
         </div>
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-[14px]">
-            <thead>
-              <tr className="border-b border-[var(--border)] text-[13px] text-[var(--faint)]">
-                {result.columns.map((col) => (
-                  <th
-                    key={col}
-                    className={`font-mono-code font-medium pb-2.5 pr-3 ${
-                      result.numericCols.has(col) ? "text-right" : "text-left"
-                    }`}
-                  >
-                    {col}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {result.rows.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={result.columns.length}
-                    className="py-4 text-[13px] text-[var(--faint)]"
-                  >
-                    Query berhasil dijalankan, 0 baris cocok pada snapshot ini.
-                  </td>
+
+        {error ? (
+          <div className="p-3 rounded-md bg-[var(--pill-negative-bg)] text-[var(--pill-negative-ink)] text-[13px] font-mono-code">
+            {error}
+          </div>
+        ) : !result ? (
+          <p className="text-[13px] text-[var(--faint)]">
+            {catalog.tables.length === 0
+              ? "Belum ada tabel Iceberg. Unggah data terlebih dahulu di menu Ingest & Scraper."
+              : "Klik Jalankan Query untuk mengeksekusi SQL di DuckDB."}
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-[13px]">
+              <thead>
+                <tr className="border-b border-[var(--border)] text-[12px] text-[var(--faint)]">
+                  {result.columns.map((col) => (
+                    <th key={col} className="font-mono-code text-left font-medium pb-2.5 pr-3">
+                      {col}
+                    </th>
+                  ))}
                 </tr>
-              ) : (
-                result.rows.map((row, ri) => (
-                  <tr
-                    key={ri}
-                    className="border-b border-[var(--rule)] last:border-b-0 hover:bg-[var(--raised)]"
-                  >
-                    {row.map((cell, ci) => {
-                      const col = result.columns[ci];
-                      return (
-                        <td
-                          key={ci}
-                          className={`py-3 pr-3 ${
-                            result.numericCols.has(col)
-                              ? "text-right tabular-nums"
-                              : "text-left"
-                          } ${col.includes("kode") ? "font-mono-code text-[13px]" : ""}`}
-                        >
+              </thead>
+              <tbody>
+                {result.rows.length === 0 ? (
+                  <tr>
+                    <td colSpan={result.columns.length} className="py-4 text-[var(--faint)]">
+                      0 baris dikembalikan.
+                    </td>
+                  </tr>
+                ) : (
+                  result.rows.map((row, ri) => (
+                    <tr
+                      key={ri}
+                      className="border-b border-[var(--rule)] last:border-b-0 hover:bg-[var(--raised)]"
+                    >
+                      {row.map((cell, ci) => (
+                        <td key={ci} className="py-2.5 pr-3 tabular-nums">
                           {cell}
                         </td>
-                      );
-                    })}
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
+                      ))}
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
     </>
   );

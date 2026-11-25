@@ -7,8 +7,10 @@ import {
   Database,
   LayoutDashboard,
   Menu,
+  RefreshCw,
   Search,
   Terminal,
+  Trash2,
   UploadCloud,
   X,
 } from "lucide-react";
@@ -17,15 +19,16 @@ import { useLakehouse } from "./LakehouseContext";
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const {
-    snapshots,
-    snapshotIdx,
-    setSnapshotIdx,
-    currentSnapshot,
+    overview,
+    backendOnline,
     searchQuery,
     setSearchQuery,
     ingestRecords,
+    refreshAll,
+    handleReset,
   } = useLakehouse();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const reviewCount = ingestRecords.filter(
@@ -48,6 +51,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  const onResetClick = async () => {
+    if (!window.confirm("Kosongkan seluruh tabel Apache Iceberg dan mulai dari nol?")) {
+      return;
+    }
+    setResetting(true);
+    try {
+      await handleReset();
+    } finally {
+      setResetting(false);
+    }
+  };
+
   const navLinkClass = (active: boolean) =>
     `flex items-center gap-2.5 h-8 px-2 rounded-lg text-[14px] transition-colors ${
       active
@@ -57,7 +72,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="framed-shell">
-      {/* Brand (top-left of L-frame) */}
       <div className="hidden md:flex items-center gap-2.5 px-4 col-start-1 row-start-1">
         <svg
           width="22"
@@ -96,7 +110,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </span>
       </div>
 
-      {/* Top bar (no divider between sidebar & topbar) */}
       <header className="flex items-center justify-between gap-3 px-3 md:pl-2 md:pr-4 col-start-1 md:col-start-2 row-start-1">
         <button
           type="button"
@@ -115,7 +128,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             type="search"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Cari OPD, kode rekening, atau tabel Iceberg..."
+            placeholder="Cari OPD atau tabel Iceberg..."
             className="w-full h-8 pl-8 pr-10 rounded-md border border-[var(--border)] bg-white text-[13px] text-[var(--text)] placeholder:text-[var(--faint)] focus:outline-none focus:border-[var(--accent)]"
           />
           <span className="font-mono-code text-[11px] text-[var(--faint)] border border-[var(--border)] bg-[var(--ground)] rounded px-1.5 py-px absolute right-2 top-1/2 -translate-y-1/2">
@@ -123,29 +136,23 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </span>
         </div>
 
-        <div className="flex items-center gap-2.5 ml-auto">
-          <label
-            htmlFor="snapshotSelect"
-            className="hidden sm:inline text-[12px] text-[var(--faint)]"
+        <div className="flex items-center gap-2 ml-auto">
+          <span className="hidden sm:inline font-mono-code text-[12px] text-[var(--muted)]">
+            {overview.latestSnapshotId
+              ? `snap_${overview.latestSnapshotId.slice(-8)}`
+              : "Warehouse kosong"}
+          </span>
+          <button
+            type="button"
+            onClick={() => refreshAll()}
+            className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-md border border-[var(--control)] bg-white text-[13px] font-medium text-[var(--text)] hover:bg-[var(--raised)] cursor-pointer"
           >
-            Snapshot:
-          </label>
-          <select
-            id="snapshotSelect"
-            value={snapshotIdx}
-            onChange={(e) => setSnapshotIdx(Number(e.target.value))}
-            className="h-8 px-2.5 max-w-[215px] sm:max-w-none rounded-md border border-[var(--control)] bg-white text-[13px] text-[var(--text)] cursor-pointer"
-          >
-            {snapshots.map((s, idx) => (
-              <option key={s.id} value={idx}>
-                {s.shortLabel} ({s.id})
-              </option>
-            ))}
-          </select>
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Refresh</span>
+          </button>
         </div>
       </header>
 
-      {/* Mobile drawer backdrop */}
       {drawerOpen && (
         <div
           onClick={() => setDrawerOpen(false)}
@@ -153,7 +160,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         />
       )}
 
-      {/* Sidebar */}
       <aside
         className={`flex flex-col gap-0.5 px-3 pt-2 pb-4 bg-[var(--ground)] md:sticky md:top-12 md:h-[calc(100svh-48px)] overflow-y-auto z-40 fixed top-12 bottom-0 left-0 w-[240px] md:w-auto border-r md:border-r-0 border-[var(--border)] transition-transform md:translate-x-0 ${
           drawerOpen ? "translate-x-0" : "-translate-x-full"
@@ -188,7 +194,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           className={navLinkClass(pathname === "/ingest")}
         >
           <UploadCloud className="w-4 h-4 shrink-0 stroke-[1.6]" />
-          <span>Ingest & Scraper</span>
+          <span>Ingest &amp; Scraper</span>
           {reviewCount > 0 && (
             <span className="ml-auto text-[11px] font-medium tabular-nums px-1.5 py-px rounded-full bg-[var(--pill-warning-bg)] text-[var(--pill-warning-ink)]">
               {reviewCount}
@@ -204,19 +210,32 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <span>SQL Explorer</span>
         </Link>
 
-        <div className="mt-auto pt-3 px-2 border-t border-[var(--border)] text-[12px] text-[var(--muted)] flex flex-col gap-1">
+        <div className="mt-auto pt-3 px-2 border-t border-[var(--border)] text-[12px] text-[var(--muted)] flex flex-col gap-1.5">
           <div className="flex items-center gap-1.5 text-[var(--text)] font-medium">
-            <span className="w-1.5 h-1.5 rounded-full bg-[var(--positive)]" />
-            <span>PyIceberg · DuckDB</span>
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                backendOnline ? "bg-[var(--positive)]" : "bg-[var(--negative)]"
+              }`}
+            />
+            <span>{backendOnline ? "PyIceberg · DuckDB" : "Backend Offline"}</span>
           </div>
-          <div className="font-mono-code text-[12px]">{currentSnapshot.id}</div>
-          <div className="text-[12px] text-[var(--faint)]">
-            Siap hubungkan API backend
+          <div className="text-[12px] text-[var(--faint)] tabular-nums">
+            {overview.totals.tableCount} tabel · {overview.totals.opdCount} OPD
           </div>
+          {overview.totals.tableCount > 0 && (
+            <button
+              type="button"
+              disabled={resetting}
+              onClick={onResetClick}
+              className="mt-1 inline-flex items-center gap-1.5 text-[12px] text-[var(--negative)] hover:underline cursor-pointer w-fit"
+            >
+              <Trash2 className="w-3 h-3" />
+              <span>{resetting ? "Mengosongkan..." : "Reset Warehouse"}</span>
+            </button>
+          )}
         </div>
       </aside>
 
-      {/* Main white inset sheet */}
       <main className="framed-sheet col-start-1 md:col-start-2 row-start-2 flex flex-col gap-6">
         {children}
       </main>

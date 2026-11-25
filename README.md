@@ -1,18 +1,24 @@
 # APBD-Lakehouse (SuraLake)
 
-Platform **Data Lakehouse APBD Kota Surabaya** berbasis **Next.js (App Router)** + **Apache Iceberg** (Medallion Architecture: `Bronze → Silver → Gold`), `PyIceberg`, dan `DuckDB`.
+Platform **Data Lakehouse APBD Kota Surabaya** berbasis **Next.js 15 (App Router)** + **FastAPI** + **Apache Iceberg (`PyIceberg`)** + **DuckDB**.
 
-## Menjalankan Lokal
+Secara default warehouse dimulai **kosong (0 tabel, 0 data)** agar pengguna bisa langsung menguji alur *end-to-end* mulai dari unggah berkas/URL hingga menjadi tabel `Bronze → Silver → Gold`.
 
+## Menjalankan Lokal (2 Terminal)
+
+### 1. Backend (FastAPI + PyIceberg + DuckDB — port 8000)
 ```bash
-npm install
+cd "/Users/seantandjaja/Documents/Codes/Genesys/APBD Lakehouse/backend"
+source .venv/bin/activate
+uvicorn main:app --port 8000 --reload
+```
+
+### 2. Frontend (Next.js — port 3000)
+```bash
+cd "/Users/seantandjaja/Documents/Codes/Genesys/APBD Lakehouse"
 npm run dev
 ```
 
-Buka `http://localhost:3000`.
-
-## Halaman Utama
-- **`/` (Ikhtisar APBD — Gold):** Dashboard eksekutif dengan Time-Travel Snapshot switcher (`Murni 2026`, `Pergeseran I`, `PAK 2026`), 5 KPI interaktif, ringkasan pipeline Medallion Iceberg, dan tabel serapan per OPD.
-- **`/catalog` (Katalog Iceberg):** Daftar tabel `bronze.*`, `silver.*`, `gold.*`, inspeksi skema & upstream lineage, serta riwayat snapshot Time-Travel.
-- **`/ingest` (Unified Ingestion & Web Scraper):** Upload multi-format (`.xlsx`, `.csv`, `.pdf`, gambar/scan OCR) dan URL web scraper (`surabaya.go.id`) dengan deduplikasi SHA-256 dan antrean review.
-- **`/sql` (SQL Explorer):** Workbench query DuckDB SQL langsung ke tabel Iceberg (termasuk preset *Time-Travel Murni vs PAK*) + Export CSV.
+Buka `http://localhost:3000` dan mulai unggah berkas di menu **Ingest & Scraper** (`/ingest`).
+- **Auto-detect format:** Laporan Monitoring Semua PD (`.xlsx`), Tabel eBudgeting (`.xlsx`), CSV/Excel umum, PDF (`pdfplumber`), Gambar (antrean OCR), dan URL website (`surabaya.go.id`).
+- **Reset kapan saja:** Klik **Reset Warehouse** di pojok kiri bawah sidebar untuk kembali ke kondisi kosong.

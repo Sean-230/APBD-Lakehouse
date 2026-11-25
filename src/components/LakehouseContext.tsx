@@ -1,48 +1,83 @@
 "use client";
 
-import React, { createContext, useContext, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
 import {
-  ICEBERG_SNAPSHOTS,
-  INITIAL_INGEST_RECORDS,
-  type IcebergSnapshot,
+  EMPTY_OVERVIEW,
+  fetchCatalog,
+  fetchIngestLogs,
+  fetchOverview,
+  resetWarehouse,
+  type CatalogResponse,
   type IngestRecord,
-} from "@/lib/lakehouse-data";
+  type OverviewResponse,
+} from "@/lib/api";
 
 interface LakehouseContextValue {
-  snapshots: IcebergSnapshot[];
-  snapshotIdx: number;
-  setSnapshotIdx: (idx: number) => void;
-  currentSnapshot: IcebergSnapshot;
+  overview: OverviewResponse;
+  catalog: CatalogResponse;
+  ingestRecords: IngestRecord[];
+  loading: boolean;
+  backendOnline: boolean;
+  error: string | null;
   searchQuery: string;
   setSearchQuery: (q: string) => void;
-  ingestRecords: IngestRecord[];
-  addIngestRecord: (record: IngestRecord) => void;
+  refreshAll: () => Promise<void>;
+  handleReset: () => Promise<void>;
 }
 
 const LakehouseContext = createContext<LakehouseContextValue | null>(null);
 
 export function LakehouseProvider({ children }: { children: React.ReactNode }) {
-  const [snapshotIdx, setSnapshotIdx] = useState(0);
+  const [overview, setOverview] = useState<OverviewResponse>(EMPTY_OVERVIEW);
+  const [catalog, setCatalog] = useState<CatalogResponse>({ tables: [], snapshots: [] });
+  const [ingestRecords, setIngestRecords] = useState<IngestRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [backendOnline, setBackendOnline] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [ingestRecords, setIngestRecords] = useState<IngestRecord[]>(
-    INITIAL_INGEST_RECORDS
-  );
 
-  const addIngestRecord = (record: IngestRecord) => {
-    setIngestRecords((prev) => [record, ...prev]);
-  };
+  const refreshAll = useCallback(async () => {
+    try {
+      const [ov, cat, logs] = await Promise.all([
+        fetchOverview(),
+        fetchCatalog(),
+        fetchIngestLogs(),
+      ]);
+      setOverview(ov);
+      setCatalog(cat);
+      setIngestRecords(logs);
+      setBackendOnline(true);
+      setError(null);
+    } catch {
+      setBackendOnline(false);
+      setError("Backend FastAPI (port 8000) belum berjalan. Jalankan uvicorn terlebih dahulu.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshAll();
+  }, [refreshAll]);
+
+  const handleReset = useCallback(async () => {
+    await resetWarehouse();
+    await refreshAll();
+  }, [refreshAll]);
 
   return (
     <LakehouseContext.Provider
       value={{
-        snapshots: ICEBERG_SNAPSHOTS,
-        snapshotIdx,
-        setSnapshotIdx,
-        currentSnapshot: ICEBERG_SNAPSHOTS[snapshotIdx],
+        overview,
+        catalog,
+        ingestRecords,
+        loading,
+        backendOnline,
+        error,
         searchQuery,
         setSearchQuery,
-        ingestRecords,
-        addIngestRecord,
+        refreshAll,
+        handleReset,
       }}
     >
       {children}
