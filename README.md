@@ -8,7 +8,7 @@ Seluruh siklus data mengikuti **Medallion Architecture** berbasis **Apache Icebe
 Upload / Web Scrape  ──►  1. BRONZE (Mentah)  ──►  2. SILVER (Bersih)  ──►  3. GOLD (Kurasi/Ringkasan)  ──►  4. VECTOR AI (Gold-only)
                                                                                      │                                 │
                                                                                      ▼                                 ▼
-                                                                           Dashboard Visual & SQL              Hybrid Groq Chatbot
+                                                                           Dashboard Visual & SQL              Hybrid Gemini Chatbot
 ```
 
 ---
@@ -17,7 +17,7 @@ Upload / Web Scrape  ──►  1. BRONZE (Mentah)  ──►  2. SILVER (Bersih
 
 | Rute | Halaman | Fungsi |
 | :--- | :--- | :--- |
-| **`/`** | **SuraLake AI Chatbot** | Antarmuka tanya-jawab publik berbasis **Groq AI** yang terhubung secara *hybrid* ke **DuckDB SQL** (untuk hitungan angka eksak) dan **Vector Search lokal** (untuk pencarian semantik teks/dokumen/rincian kegiatan). |
+| **`/`** | **SuraLake AI Chatbot** | Antarmuka tanya-jawab publik berbasis **Google Gemini** yang terhubung secara *hybrid* ke **DuckDB SQL** (untuk hitungan angka eksak) dan **Vector Search lokal** (untuk pencarian semantik teks/dokumen/rincian kegiatan). |
 | **`/panel`** | **Ikhtisar APBD (Visual)** | Dashboard ramah non-teknis: Donut Ring serapan kota, batang perbandingan 8 dinas anggaran terbesar, sorotan serapan terendah & tertinggi, grafik anggaran prioritas (Pendidikan, Kemiskinan, Stunting, Infrastruktur), serta switch **Kartu Visual / Tabel Detail**. |
 | **`/panel/catalog`** | **Katalog Iceberg, Pipeline Visual & CRUD** | Papan alur visual interaktif 4 tahap (**Bronze → Silver → Gold → Vector AI**), *lineage highlighting*, *progress stepper*, uji *semantic search* langsung, riwayat snapshot Apache Iceberg, serta **CRUD lengkap** (tambah/edit/hapus baris & hapus tabel). |
 | **`/panel/ingest`** | **Unified Ingestion & Web Scraper** | Upload berkas `.xlsx`, `.csv`, `.pdf`, dan gambar (`.png`, `.jpg`, `.webp` dengan ekstraksi teks **RapidOCR** otomatis), serta web scraper URL (mis. `surabaya.go.id`) yang masuk ke layer **Bronze**. |
@@ -33,7 +33,7 @@ Upload / Web Scrape  ──►  1. BRONZE (Mentah)  ──►  2. SILVER (Bersih
   - **Apache Iceberg (`PyIceberg`)** + **PyArrow** — penyimpanan file **Parquet** terversi (*snapshots*, ACID, evolusi skema) dengan SQLite Catalog lokal (`warehouse/catalog.db`).
   - **DuckDB** — mesin analitik SQL super cepat (*in-memory*, *read-only sandboxed*) untuk transformasi Silver → Gold, SQL Explorer, dan tool-calling AI.
 - **AI, Vector Search & OCR:**
-  - **Groq API** (`openai/gpt-oss-120b` dengan fallback `openai/gpt-oss-20b` & `qwen/qwen3.8-27b`) + *Tool Calling*.
+  - **Google Gemini API** (`gemini-3.8-flash` dengan fallback `gemini-3.5-flash` & `gemini-3.5-flash-lite`, lewat endpoint kompatibel OpenAI) + *Tool Calling*.
   - **FastEmbed (`paraphrase-multilingual-MiniLM-L12-v2`, ONNX)** — embedding lokal gratis tanpa kuota API, disimpan di `warehouse/vectors.parquet` (khusus layer **Gold**).
   - **RapidOCR (`rapidocr-onnxruntime`)** — ekstraksi teks lokal dari berkas gambar `PNG`/`JPG`/`WEBP`.
 
@@ -47,9 +47,9 @@ APBD Lakehouse/
 │   ├── main.py              # FastAPI endpoints (Ingest, CRUD, Transform, SQL, Vector, Chat)
 │   ├── lakehouse.py         # PyIceberg Catalog, Medallion ETL, DuckDB sandbox, SSRF guard
 │   ├── vector_store.py      # FastEmbed lokal, RapidOCR, cosine similarity search (Gold-only)
-│   ├── chatbot.py           # Groq AI Agent (Hybrid DuckDB SQL + Vector Search tools)
+│   ├── chatbot.py           # Gemini AI Agent (Hybrid DuckDB SQL + Vector Search tools)
 │   ├── requirements.txt     # Dependensi Python
-│   └── .env                 # API key Groq (lokal, gitignored)
+│   └── .env                 # API key Gemini (lokal, gitignored)
 ├── src/
 │   ├── app/
 │   │   ├── page.tsx         # Halaman utama: Chatbot APBD (/)
@@ -80,23 +80,17 @@ APBD Lakehouse/
 ### Prasyarat
 - **Node.js** `>= 20` & **npm**
 - **Python** `>= 3.11` (disarankan `3.12`)
-- **Groq API Key** (didapatkan dari [console.groq.com](https://console.groq.com))
+- **Gemini API Key** (buat di [aistudio.google.com/apikey](https://aistudio.google.com/apikey); bentuknya diawali `AIza…`)
 
 ### 1. Konfigurasi Environment Backend
 Buat file `backend/.env`:
 
 ```env
-GROQ_API_KEY=gsk_isi_api_key_groq_anda
-GROQ_MODEL=openai/gpt-oss-120b
+GEMINI_API_KEY=AIza_isi_api_key_gemini_anda
+GEMINI_MODEL=gemini-3.8-flash
 ```
 
-Buat juga file `.env.local` di root proyek. Tanpa kata sandi ini, `/panel` dan semua API selain chat terkunci:
-
-```env
-ADMIN_PASSWORD=ganti_dengan_kata_sandi_kuat
-```
-
-Saat browser meminta login, nama pengguna boleh apa saja.
+> **Belum ada login.** `/` (chatbot) dan `/panel` terbuka untuk siapa saja yang bisa membuka alamat frontend. Jalankan hanya di jaringan yang dipercaya, mis. `npm run dev -- -H 127.0.0.1` agar hanya bisa dibuka dari komputer ini.
 
 ### 2. Jalankan Backend (FastAPI — Port `8000`)
 ```bash
@@ -130,7 +124,8 @@ cd backend && .venv/bin/python -m unittest -v
 
 ### Catatan untuk Docker / Server
 - Publikasikan **hanya port frontend**. Port backend `8000` tidak punya login, jadi jangan dibuka ke jaringan.
-- Di container frontend, set `BACKEND_URL` **saat build** dan `ADMIN_PASSWORD` **saat jalan**, lalu build ulang image setelah memperbarui kode.
+- Di container frontend, set `BACKEND_URL` **saat build**, lalu build ulang image setelah memperbarui kode.
+- Belum ada login: jangan buka port frontend ke internet sebelum autentikasi ditambahkan.
 - Jalankan backend dengan **satu worker** uvicorn.
 - Index vector untuk ±10.000 baris butuh sekitar 2 menit dan 1,5 GB RAM di laptop; sediakan minimal 2 GB untuk container backend.
 

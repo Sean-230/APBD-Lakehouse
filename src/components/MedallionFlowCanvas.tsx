@@ -477,7 +477,7 @@ export function MedallionFlowCanvas({
               4. VECTOR · Chatbot AI
             </span>
             <span className="font-mono-code text-[11px] text-[var(--faint)] tabular-nums">
-              {vectorStats?.sizeKb ?? 0} KB
+              {((vectorStats?.sizeKb ?? 0) / 1024).toFixed(1).replace(".", ",")} MB
             </span>
           </div>
 
@@ -489,21 +489,35 @@ export function MedallionFlowCanvas({
           </div>
 
           {vectorStats && vectorStats.sources.length > 0 ? (
-            <div className="flex flex-col gap-1 max-h-[110px] overflow-y-auto text-[12px]">
-              {vectorStats.sources.map((s) => (
-                <div
-                  key={s.source}
-                  className="flex items-center justify-between gap-2 py-0.5 border-b border-[var(--rule)] last:border-b-0"
-                >
-                  <span className="font-mono-code text-[11px] truncate text-[var(--text)]">
-                    {s.source}
-                  </span>
-                  <span className="tabular-nums text-[var(--faint)] shrink-0">
-                    {s.chunks}
-                  </span>
-                </div>
-              ))}
-            </div>
+            <table className="w-full table-fixed border-collapse text-[12px] border border-[var(--rule)] rounded-md overflow-hidden">
+              <thead>
+                <tr className="bg-[var(--ground)] text-[11px] text-[var(--faint)]">
+                  <th className="text-left font-medium px-2 py-1.5">Tabel Gold</th>
+                  <th className="text-right font-medium px-2 py-1.5 w-[72px]">Chunks</th>
+                </tr>
+              </thead>
+              <tbody>
+                {vectorStats.sources.map((s) => (
+                  <tr key={s.source} className="border-t border-[var(--rule)]">
+                    <td className="px-2 py-1.5">
+                      <div title={s.source} className="font-mono-code text-[11px] leading-4 text-[var(--text)]">
+                        {/* zero-width spaces let long names wrap at "_" instead of mid-word */}
+                        {s.source.replace(/^gold\./, "").replaceAll("_", "_​")}
+                      </div>
+                      <div className="mt-1 h-1 rounded-full bg-[var(--rule)] overflow-hidden">
+                        <div
+                          className="h-full bg-[var(--accent)]"
+                          style={{ width: `${(s.chunks / Math.max(1, vectorStats.totalChunks)) * 100}%` }}
+                        />
+                      </div>
+                    </td>
+                    <td className="px-2 py-1.5 text-right tabular-nums align-top text-[var(--muted)]">
+                      {s.chunks.toLocaleString("id-ID")}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           ) : (
             <p className="text-[12px] text-[var(--faint)]">
               Hanya tabel <strong>Gold</strong> yang dapat masuk ke Vector Store. Promosikan data ke Gold lalu klik <strong>Ke Vector</strong>.

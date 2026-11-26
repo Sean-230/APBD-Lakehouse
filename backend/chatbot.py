@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,32 +17,30 @@ from lakehouse import (
 from vector_store import get_vector_stats, search_vectors
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_MODELS = [
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3.8-27b",
-]
+# Gemini's OpenAI-compatible endpoint: same request/response shape, including tool calls.
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+# Tried in order; a busy (503) or rate-limited model falls through to the next.
+DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
 
 
-def _load_env_file() -> None:
+def _read_env_file() -> dict[str, str]:
     if not ENV_PATH.exists():
-        return
+        return {}
+    values = {}
     for raw_line in ENV_PATH.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        k = k.strip()
-        v = v.strip().strip('"').strip("'")
-        if k and k not in os.environ:
-            os.environ[k] = v
+        values[k.strip()] = v.strip().strip('"').strip("'")
+    return values
 
 
-def _get_groq_config() -> tuple[str, list[str]]:
-    _load_env_file()
-    api_key = os.environ.get("GROQ_API_KEY", "").strip()
-    preferred = os.environ.get("GROQ_MODEL", "").strip()
+def _get_llm_config() -> tuple[str, list[str]]:
+    # Read on every question, so editing backend/.env needs no restart; real env vars (Docker) are the fallback.
+    env = {**os.environ, **_read_env_file()}
+    api_key = env.get("GEMINI_API_KEY", "").strip()
+    preferred = env.get("GEMINI_MODEL", "").strip()
     models = ([preferred] if preferred else []) + [m for m in DEFAULT_MODELS if m != preferred]
     return api_key, models
 
@@ -144,13 +143,13 @@ def _build_system_prompt() -> str:
     return f"""Kamu adalah **SuraLake AI**, asisten analis data APBD Kota Surabaya yang terhubung langsung ke Apache Iceberg Data Lakehouse (Bronze → Silver → Gold) melalui DuckDB dan Vector Search lokal.
 
 Aturan wajib:
-1. Jawab dalam BAHASA YANG SAMA dengan pesan terakhir pengguna (pertanyaan berbahasa Inggris dijawab dalam bahasa Inggris), jelas, ramah, dan mudah dipahami orang non-teknis.
+1. LANGUAGE: always reply in the same language as the user's latest message. An English question gets a fully English answer. Pertanyaan bahasa Indonesia dijawab dalam bahasa Indonesia. Jawaban harus jelas, ramah, dan mudah dipahami orang non-teknis.
 2. **JANGAN PERNAH mengarang atau menebak angka.** Untuk hitungan angka, total, ranking, atau filter tabel, WAJIB panggil `run_sql_query` atau `get_lakehouse_overview`.
 3. Untuk pertanyaan tentang isi dokumen PDF, gambar (OCR), hasil scrape web, tautan RKA, atau pencarian topik bebas, panggil `search_vector_knowledge`.
-4. Prioritaskan query pada tabel `gold.*` untuk ringkasan OPD/tematik/anomali, dan `silver.*` untuk rincian pekerjaan atau komponen eBudgeting. Jika query `silver.ebudgeting_rincian`, selalu perhatikan kolom `tahap` (filter `LOWER(tahap) = 'pak'` atau kelompokkan per `tahap` agar tidak double-counting!).
+4. Prioritaskan query pada tabel `gold.*` untuk ringkasan OPD/tematik/anomali, dan `silver.*` untuk rincian pekerjaan atau komponen eBudgeting. Untuk angka eBudgeting (komponen, belanja, sub kegiatan) WAJIB pakai `gold.ebudgeting_curated` atau `gold.apbd_subkegiatan_summary`: isinya sudah tahap final (PAK). `silver.ebudgeting_rincian` berisi semua versi (murni, revisi, PAK) dari anggaran yang sama, jadi menjumlahkannya tanpa filter tahap = HITUNG DOBEL. Pakai silver hanya jika pengguna bertanya riwayat per tahap.
 5. Hasil tool sudah memberi label Rupiah untuk angka besar, contoh "930250224427 (Rp 930,25 Miliar)". Di jawaban tulis label itu saja (contoh **Rp 930,25 Miliar**), tanpa angka panjangnya kecuali diminta; JANGAN mengonversi Juta/Miliar/Triliun sendiri. 1 Triliun = 1.000 Miliar.
 6. Jika warehouse masih kosong, beri tahu pengguna dengan ramah bahwa belum ada data yang diunggah.
-7. Untuk RSUD dengan serapan SP2D sangat rendah, beri catatan singkat bahwa RSUD berstatus BLUD sehingga sebagian pencairan tidak melewati mekanisme SP2D reguler.
+7. Hanya untuk OPD yang namanya mengandung "RSUD" dan serapan SP2D-nya sangat rendah, beri catatan singkat bahwa RSUD berstatus BLUD sehingga sebagian pencairan tidak melewati mekanisme SP2D reguler.
 8. Nilai SP2D/serapan yang kosong (NULL) berarti data pencairan BELUM diunggah, bukan nol.
 9. Filter nama OPD memakai ILIKE '%kata kunci%' (contoh: "rs eka candrarini" = nama_opd ILIKE '%eka candrarini%').
 10. Pertanyaan belanja barang/pos tertentu (contoh: obat): jika OPD tercakup di silver.ebudgeting_rincian, cari di nama_komponen, nama_detil, nama_rekening (perhatikan tahap). Jika tidak tercakup, cari di silver.monitoring_pekerjaan HANYA pada kolom nama_pekerjaan (nama sub kegiatan menggabungkan beberapa jenis belanja, jadi jangan dipakai untuk total pos), lalu jelaskan bahwa angkanya berdasarkan nama paket pekerjaan. Sebutkan paket terbesar yang dihitung, dan ingat '%obat%' juga cocok dengan kata seperti "pengobatan".
@@ -159,6 +158,7 @@ Aturan wajib:
 13. Pertanyaan lanjutan ("untuk pos belanja obat") memakai OPD dan konteks dari percakapan sebelumnya.
 14. Jika hasil query kosong, coba kata kunci atau tabel lain sebelum menyimpulkan datanya tidak ada.
 15. Tulis jawaban dengan teks biasa, tebal, daftar, atau tabel markdown. Jangan memakai kutipan (>) dan jangan menulis tag tool_call.
+16. Tautan ditulis sebagai link markdown dengan nama singkat, contoh [RKA Kec. Simokerto](https://...), bukan URL panjang. Saat menampilkan daftar dokumen/tautan, tambahkan penjelasan singkat (satu kalimat) tentang isi dokumen berdasarkan judul atau teks tautannya; jangan mengarang isi yang tidak ada di data.
 
 Cakupan silver.ebudgeting_rincian: {_ebudgeting_coverage(tables)}
 
@@ -235,11 +235,17 @@ def _run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     return {"error": f"Tool tidak dikenal: {name}"}
 
 
+# Model -> time (monotonic) until which it is skipped. A busy Gemini model can hang for the full
+# timeout on every request, so after one failure we skip it for a while instead of paying that again.
+_MODEL_COOLDOWN_S = 300
+_model_busy_until: dict[str, float] = {}
+
+
 class QuotaError(RuntimeError):
     """Every model refused because of the provider's rate limit."""
 
 
-def _call_groq(
+def _call_llm(
     api_key: str,
     models: list[str],
     messages: list[dict[str, Any]],
@@ -251,31 +257,40 @@ def _call_groq(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    with httpx.Client(timeout=45.0) as client:
-        for model in models:
+    now = time.monotonic()
+    ready = [m for m in models if _model_busy_until.get(m, 0) <= now] or models
+    with httpx.Client(timeout=httpx.Timeout(45.0, connect=10.0)) as client:
+        for model in ready:
             payload: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
                 "temperature": 0.2,
-                "max_tokens": 1400,
+                # Gemini counts its internal "thinking" against this limit, so leave room.
+                "max_tokens": 4000,
             }
             if use_tools:
                 payload["tools"] = TOOLS
                 payload["tool_choice"] = "auto"
             try:
-                resp = client.post(GROQ_API_URL, headers=headers, json=payload)
+                resp = client.post(GEMINI_API_URL, headers=headers, json=payload)
                 # Any failure moves to the next model. Never retry without tools: the model
                 # then writes its tool call as plain text, which the user would see.
                 rate_limited = rate_limited or resp.status_code == 429
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    _model_busy_until[model] = time.monotonic() + _MODEL_COOLDOWN_S
                 if resp.status_code >= 400:
-                    last_err = RuntimeError(f"Groq {model} HTTP {resp.status_code}: {resp.text[:300]}")
+                    last_err = RuntimeError(f"Gemini {model} HTTP {resp.status_code}: {resp.text[:300]}")
                     continue
                 return resp.json(), model
+            except httpx.TransportError as exc:  # timeouts and connection failures
+                _model_busy_until[model] = time.monotonic() + _MODEL_COOLDOWN_S
+                last_err = exc
+                continue
             except Exception as exc:
                 last_err = exc
                 continue
     error = QuotaError if rate_limited else RuntimeError
-    raise error(f"Gagal menghubungi Groq API: {last_err}")
+    raise error(f"Gagal menghubungi Gemini API: {last_err}")
 
 
 _TEXT_CALL_RE = re.compile(r"<function=([\w-]+)>(.*?)</function>", re.DOTALL)
@@ -302,6 +317,19 @@ def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
     ]
 
 
+_EN_WORDS = {"what", "how", "which", "the", "is", "are", "of", "much", "many", "and", "total", "budget", "show", "list", "please", "who", "why", "does", "so", "far"}
+_ID_WORDS = {"apa", "berapa", "yang", "dan", "di", "untuk", "dari", "anggaran", "dinas", "tolong", "mana", "saja", "ini", "itu", "ada"}
+
+
+def _with_language_hint(message: str) -> str:
+    """Small models ignore the language rule in the system prompt, so English questions get an explicit nudge."""
+    words = re.findall(r"[a-z]+", message.lower())
+    english = sum(w in _EN_WORDS for w in words)
+    if english >= 2 and english > sum(w in _ID_WORDS for w in words):
+        return f"{message}\n\n(Answer in English.)"
+    return message
+
+
 def _clean_answer(content: str) -> str:
     return _TAG_BLOCK_RE.sub("", content).strip()
 
@@ -309,9 +337,9 @@ def _clean_answer(content: str) -> str:
 def chat_with_lakehouse(
     message: str, history: list[dict[str, str]] | None = None
 ) -> dict[str, Any]:
-    api_key, models = _get_groq_config()
+    api_key, models = _get_llm_config()
     if not api_key:
-        raise RuntimeError("GROQ_API_KEY belum dikonfigurasi di backend/.env.")
+        raise RuntimeError("GEMINI_API_KEY belum dikonfigurasi di backend/.env.")
 
     user_msg = message.strip()
     if not user_msg:
@@ -323,7 +351,7 @@ def chat_with_lakehouse(
         content = _clean_answer(str(item.get("content") or ""))
         if role in ("user", "assistant") and content:
             messages.append({"role": role, "content": content[:2500]})
-    messages.append({"role": "user", "content": user_msg})
+    messages.append({"role": "user", "content": _with_language_hint(user_msg)})
 
     sql_used: list[dict[str, Any]] = []
     used_model = models[0]
@@ -334,9 +362,10 @@ def chat_with_lakehouse(
         final_round = round_no == tool_rounds
         if final_round:
             messages.append(
-                {"role": "system", "content": "Jawab sekarang dari data yang sudah ada, tanpa memanggil tool."}
+                # Gemini accepts system text only at the start, so this nudge is a user turn.
+                {"role": "user", "content": "Jawab sekarang dari data yang sudah ada, tanpa memanggil tool."}
             )
-        data, used_model = _call_groq(api_key, models, messages, use_tools=not final_round)
+        data, used_model = _call_llm(api_key, models, messages, use_tools=not final_round)
         assistant_msg = data["choices"][0]["message"]
         content = assistant_msg.get("content") or ""
         tool_calls = assistant_msg.get("tool_calls") or _parse_text_tool_calls(content)

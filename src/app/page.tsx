@@ -41,8 +41,28 @@ function MessageBody({ text }: { text: string }) {
   let i = 0;
 
   const renderInline = (line: string, keyPrefix: string) => {
-    const parts = line.split(/(\*\*[^*]+\*\*|`[^`]+`|\*[^*\s](?:[^*]*[^*\s])?\*)/g);
+    const parts = line.split(
+      /(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|<https?:\/\/[^\s>]+>|https?:\/\/[^\s<>|)]*[^\s<>|).,;:!?]|\*\*[^*]+\*\*|`[^`]+`|\*[^*\s](?:[^*]*[^*\s])?\*)/g
+    );
     return parts.map((part, idx) => {
+      // Links: [label](url), <url> or a bare url. Only http(s) can match, so javascript: links never render.
+      const md = part.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+      const url = md ? md[2] : part.match(/^<?(https?:\/\/[^\s>]+)>?$/)?.[1];
+      if (url) {
+        const fileName = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
+        return (
+          <a
+            key={`${keyPrefix}-${idx}`}
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={url}
+            className="text-[var(--accent)] font-medium underline underline-offset-2 break-all hover:opacity-80"
+          >
+            {md ? md[1] : fileName || new URL(url).hostname}
+          </a>
+        );
+      }
       if (part.startsWith("**") && part.endsWith("**")) {
         return (
           <strong key={`${keyPrefix}-${idx}`} className="font-semibold text-[var(--text)]">

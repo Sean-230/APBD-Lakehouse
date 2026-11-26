@@ -196,6 +196,32 @@ class QaRegressions(Base):
         self.assertEqual(int(scores.argmax()), 500)
 
 
+class ModelFallback(unittest.TestCase):
+    def test_busy_model_is_skipped_on_the_next_call(self):
+        calls = []
+
+        def handler(request):
+            model = json.loads(request.content)["model"]
+            calls.append(model)
+            if model == "busy":
+                raise httpx.ReadTimeout("hang")
+            return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+        real = httpx.Client
+        chatbot._model_busy_until.clear()
+        with mock.patch.object(chatbot.httpx, "Client", lambda **kw: real(transport=httpx.MockTransport(handler), **kw)):
+            chatbot._call_llm("k", ["busy", "good"], [])
+            chatbot._call_llm("k", ["busy", "good"], [])
+        self.assertEqual(calls, ["busy", "good", "good"])
+
+
+class Language(unittest.TestCase):
+    def test_english_questions_get_a_hint(self):
+        self.assertTrue(chatbot._with_language_hint("What is the total budget of Dinas Kesehatan?").endswith("(Answer in English.)"))
+        self.assertEqual(chatbot._with_language_hint("berapa anggaran dinas kesehatan"), "berapa anggaran dinas kesehatan")
+        self.assertEqual(chatbot._with_language_hint("total anggaran dinas pendidikan"), "total anggaran dinas pendidikan")
+
+
 class Vectors(Base):
     def test_every_row_is_indexed(self):
         table = pa.Table.from_pylist([{"nama": f"item {i}"} for i in range(900)])
@@ -211,8 +237,8 @@ class Chat(Base):
     def ask(self, replies):
         queue = iter(replies)
         fake = lambda *a, **k: ({"choices": [{"message": {"content": next(queue)}}]}, "m")
-        with mock.patch.object(chatbot, "_call_groq", fake), mock.patch.object(
-            chatbot, "_get_groq_config", lambda: ("key", ["m"])
+        with mock.patch.object(chatbot, "_call_llm", fake), mock.patch.object(
+            chatbot, "_get_llm_config", lambda: ("key", ["m"])
         ):
             return chatbot.chat_with_lakehouse("obat?")
 
