@@ -7,6 +7,7 @@ import {
   Database,
   LayoutDashboard,
   Menu,
+  MessageSquare,
   RefreshCw,
   Search,
   Terminal,
@@ -166,12 +167,24 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         }`}
       >
         <div className="px-2 mt-1.5 mb-1.5 text-[12px] text-[var(--faint)]">
-          Eksekutif (Gold)
+          Asisten AI
         </div>
         <Link
           href="/"
           onClick={() => setDrawerOpen(false)}
           className={navLinkClass(pathname === "/")}
+        >
+          <MessageSquare className="w-4 h-4 shrink-0 stroke-[1.6]" />
+          <span>Chatbot APBD</span>
+        </Link>
+
+        <div className="px-2 mt-5 mb-1.5 text-[12px] text-[var(--faint)]">
+          Eksekutif (Gold)
+        </div>
+        <Link
+          href="/panel"
+          onClick={() => setDrawerOpen(false)}
+          className={navLinkClass(pathname === "/panel")}
         >
           <LayoutDashboard className="w-4 h-4 shrink-0 stroke-[1.6]" />
           <span>Ikhtisar APBD</span>
@@ -181,17 +194,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           Lakehouse Studio
         </div>
         <Link
-          href="/catalog"
+          href="/panel/catalog"
           onClick={() => setDrawerOpen(false)}
-          className={navLinkClass(pathname === "/catalog")}
+          className={navLinkClass(pathname === "/panel/catalog")}
         >
           <Database className="w-4 h-4 shrink-0 stroke-[1.6]" />
           <span>Katalog Iceberg</span>
         </Link>
         <Link
-          href="/ingest"
+          href="/panel/ingest"
           onClick={() => setDrawerOpen(false)}
-          className={navLinkClass(pathname === "/ingest")}
+          className={navLinkClass(pathname === "/panel/ingest")}
         >
           <UploadCloud className="w-4 h-4 shrink-0 stroke-[1.6]" />
           <span>Ingest &amp; Scraper</span>
@@ -202,9 +215,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           )}
         </Link>
         <Link
-          href="/sql"
+          href="/panel/sql"
           onClick={() => setDrawerOpen(false)}
-          className={navLinkClass(pathname === "/sql")}
+          className={navLinkClass(pathname === "/panel/sql")}
         >
           <Terminal className="w-4 h-4 shrink-0 stroke-[1.6]" />
           <span>SQL Explorer</span>

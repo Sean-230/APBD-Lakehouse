@@ -4,6 +4,8 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from chatbot import chat_with_lakehouse, get_chat_status
+from vector_store import get_vector_stats, index_table_to_vectors, rebuild_all_vectors, search_vectors
 from lakehouse import (
     create_table_row,
     delete_table_row,
@@ -184,5 +186,64 @@ class SaveGoldRequest(BaseModel):
 def sql_save_gold(req: SaveGoldRequest):
     try:
         return save_sql_as_gold(req.query, req.table_name)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class ChatHistoryItem(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[ChatHistoryItem] = []
+
+
+@app.get("/api/chat/status")
+def chat_status():
+    return get_chat_status()
+
+
+@app.post("/api/chat")
+def chat_endpoint(req: ChatRequest):
+    try:
+        return chat_with_lakehouse(
+            req.message, [{"role": h.role, "content": h.content} for h in req.history]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+class VectorIndexRequest(BaseModel):
+    table_name: str | None = None
+
+
+class VectorSearchRequest(BaseModel):
+    query: str
+    top_k: int = 6
+
+
+@app.get("/api/vectors/stats")
+def vector_stats():
+    return get_vector_stats()
+
+
+@app.post("/api/vectors/index")
+def vector_index(req: VectorIndexRequest):
+    try:
+        if req.table_name:
+            return index_table_to_vectors(req.table_name)
+        return rebuild_all_vectors()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/vectors/search")
+def vector_search(req: VectorSearchRequest):
+    try:
+        return search_vectors(req.query, top_k=req.top_k)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -185,8 +185,9 @@ export async function executeSql(query: string): Promise<SqlResponse> {
 
 export async function resetWarehouse() {
   const res = await fetch("/api/reset", { method: "POST" });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  const data = await parseApiJson(res);
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
 }
 
 export interface TableRowsResponse {
@@ -298,6 +299,108 @@ export async function saveSqlAsGold(query: string, tableName: string) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query, table_name: tableName }),
+  });
+  const data = await parseApiJson(res);
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+export interface ChatStatusResponse {
+  configured: boolean;
+  provider: string;
+  model: string;
+}
+
+export interface ChatSqlTrace {
+  query: string;
+  reason?: string;
+  rowCount?: number;
+  elapsedMs?: number;
+  error?: string;
+}
+
+export interface ChatResponse {
+  answer: string;
+  model: string;
+  sqlUsed: ChatSqlTrace[];
+  snapshotId: string | null;
+}
+
+export async function fetchChatStatus(): Promise<ChatStatusResponse> {
+  const res = await fetch("/api/chat/status", { cache: "no-store" });
+  const data = await parseApiJson(res);
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+export async function sendChatMessage(
+  message: string,
+  history: { role: "user" | "assistant"; content: string }[]
+): Promise<ChatResponse> {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, history }),
+  });
+  const data = await parseApiJson(res);
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+export interface VectorSourceStat {
+  source: string;
+  layer: string;
+  chunks: number;
+}
+
+export interface VectorStatsResponse {
+  totalChunks: number;
+  sizeKb: number;
+  model: string;
+  sources: VectorSourceStat[];
+}
+
+export interface VectorSearchHit {
+  chunkId: string;
+  source: string;
+  layer: string;
+  score: number;
+  text: string;
+}
+
+export interface VectorSearchResponse {
+  query: string;
+  totalChunks?: number;
+  elapsedMs: number;
+  results: VectorSearchHit[];
+}
+
+export async function fetchVectorStats(): Promise<VectorStatsResponse> {
+  const res = await fetch("/api/vectors/stats", { cache: "no-store" });
+  const data = await parseApiJson(res);
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+export async function indexVectors(tableName?: string) {
+  const res = await fetch("/api/vectors/index", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ table_name: tableName || null }),
+  });
+  const data = await parseApiJson(res);
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+export async function searchVectorsApi(
+  query: string,
+  topK = 5
+): Promise<VectorSearchResponse> {
+  const res = await fetch("/api/vectors/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, top_k: topK }),
   });
   const data = await parseApiJson(res);
   if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);

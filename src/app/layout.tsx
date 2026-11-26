@@ -1,8 +1,6 @@
 import type { Metadata } from "next";
 import { IBM_Plex_Mono, IBM_Plex_Sans } from "next/font/google";
 import "./globals.css";
-import { LakehouseProvider } from "@/components/LakehouseContext";
-import { AppShell } from "@/components/AppShell";
 
 const plexSans = IBM_Plex_Sans({
   subsets: ["latin"],
@@ -17,9 +15,9 @@ const plexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SuraLake — APBD Surabaya Apache Iceberg Lakehouse",
+  title: "SuraLake — APBD Surabaya AI & Apache Iceberg Lakehouse",
   description:
-    "Platform Data Lakehouse APBD Kota Surabaya berbasis Apache Iceberg Medallion (Bronze, Silver, Gold), Unified Multi-Format Ingestion, dan DuckDB SQL Explorer.",
+    "Asisten AI (Groq + DuckDB) dan Data Lakehouse APBD Kota Surabaya berbasis Apache Iceberg Medallion (Bronze, Silver, Gold).",
 };
 
 export default function RootLayout({
@@ -29,11 +27,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="id" className={`${plexSans.variable} ${plexMono.variable}`}>
-      <body>
-        <LakehouseProvider>
-          <AppShell>{children}</AppShell>
-        </LakehouseProvider>
-      </body>
+      <body>{children}</body>
     </html>
   );
 }

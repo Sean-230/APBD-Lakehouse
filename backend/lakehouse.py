@@ -3,14 +3,18 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import duckdb
 import httpx
@@ -28,6 +32,66 @@ CATALOG_DB = WAREHOUSE_DIR / "catalog.db"
 INGEST_LOG_PATH = WAREHOUSE_DIR / "ingest_log.json"
 
 NAMESPACES = ("bronze", "silver", "gold")
+_WAREHOUSE_LOCK = threading.RLock()
+
+_FORBIDDEN_SQL_RE = re.compile(
+    r"\b(COPY|ATTACH|DETACH|INSTALL|LOAD|EXPORT|IMPORT|PRAGMA|SET|CALL|CREATE|DROP|INSERT|UPDATE|DELETE|ALTER|TRUNCATE|MERGE|READ_CSV|READ_CSV_AUTO|READ_PARQUET|READ_JSON|READ_JSON_AUTO|READ_TEXT|READ_BLOB|GLOB)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _validate_readonly_sql(query: str) -> str:
+    """Validate a single-statement read-only SELECT/WITH SQL query."""
+    q = query.strip()
+    # Strip leading single-line or block SQL comments
+    while q.startswith("--") or q.startswith("/*"):
+        if q.startswith("--"):
+            nl = q.find("\n")
+            q = "" if nl == -1 else q[nl + 1 :].strip()
+        else:
+            end = q.find("*/")
+            if end == -1:
+                raise ValueError("Komentar SQL tidak ditutup.")
+            q = q[end + 2 :].strip()
+    q = q.rstrip(";").strip()
+    if not q:
+        raise ValueError("Query SQL tidak boleh kosong.")
+    # Reject multiple statements separated by semicolons outside quoted literals
+    unquoted = re.sub(r"'[^']*'", "", q)
+    if ";" in unquoted:
+        raise ValueError("Multi-statement SQL tidak diizinkan (hanya 1 query SELECT/WITH).")
+    first_word = q.split()[0].upper()
+    if first_word not in ("SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN"):
+        raise ValueError("Hanya query baca (SELECT / WITH / SHOW / DESCRIBE) yang diizinkan.")
+    m = _FORBIDDEN_SQL_RE.search(unquoted)
+    if m:
+        raise ValueError(f"Kata kunci SQL '{m.group(1).upper()}' tidak diizinkan dalam mode baca.")
+    return q
+
+
+def _validate_public_url(url: str) -> None:
+    """Block SSRF attempts targeting localhost, loopback, or private/link-local networks."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("URL tidak valid. Harus diawali http:// atau https://")
+    host = parsed.hostname.lower()
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".local"):
+        raise ValueError("Akses ke host lokal/internal diblokir demi keamanan.")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Host tidak dapat ditemukan: {host}") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(f"Akses ke alamat jaringan internal ({ip}) diblokir.")
 
 
 def _now_iso() -> str:
@@ -119,9 +183,10 @@ def read_ingest_logs() -> list[dict[str, Any]]:
 
 
 def append_ingest_log(entry: dict[str, Any]) -> None:
-    logs = read_ingest_logs()
-    logs.insert(0, entry)
-    INGEST_LOG_PATH.write_text(json.dumps(logs, indent=2, ensure_ascii=False), encoding="utf-8")
+    with _WAREHOUSE_LOCK:
+        logs = read_ingest_logs()
+        logs.insert(0, entry)
+        INGEST_LOG_PATH.write_text(json.dumps(logs, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _write_iceberg_table(
@@ -131,22 +196,34 @@ def _write_iceberg_table(
     mode: str = "overwrite",
 ) -> dict[str, Any]:
     """Create or write a PyArrow table into an Apache Iceberg table."""
-    if catalog.table_exists(identifier):
-        tbl = catalog.load_table(identifier)
-        if mode == "append":
-            tbl.append(arrow_table)
+    with _WAREHOUSE_LOCK:
+        if catalog.table_exists(identifier):
+            tbl = catalog.load_table(identifier)
+            existing_cols = [f.name for f in tbl.schema().fields]
+            incoming_cols = list(arrow_table.schema.names)
+            if mode == "append":
+                if set(incoming_cols) - set(existing_cols):
+                    with tbl.update_schema() as update:
+                        update.union_by_name(arrow_table.schema)
+                    tbl = catalog.load_table(identifier)
+                tbl.append(arrow_table)
+            else:
+                if existing_cols != incoming_cols:
+                    catalog.drop_table(identifier)
+                    tbl = catalog.create_table(identifier, schema=arrow_table.schema)
+                    tbl.append(arrow_table)
+                else:
+                    tbl.overwrite(arrow_table)
         else:
-            tbl.overwrite(arrow_table)
-    else:
-        tbl = catalog.create_table(identifier, schema=arrow_table.schema)
-        tbl.append(arrow_table)
+            tbl = catalog.create_table(identifier, schema=arrow_table.schema)
+            tbl.append(arrow_table)
 
-    snap = tbl.current_snapshot()
-    return {
-        "table": identifier,
-        "rows": arrow_table.num_rows,
-        "snapshot_id": str(snap.snapshot_id) if snap else None,
-    }
+        snap = tbl.current_snapshot()
+        return {
+            "table": identifier,
+            "rows": arrow_table.num_rows,
+            "snapshot_id": str(snap.snapshot_id) if snap else None,
+        }
 
 
 def _read_table_arrow(catalog: SqlCatalog, identifier: str) -> pa.Table | None:
@@ -234,10 +311,31 @@ def _rebuild_gold_layers(catalog: SqlCatalog) -> list[dict[str, Any]]:
             if anomalies.num_rows > 0:
                 results.append(_write_iceberg_table(catalog, "gold.dq_anomaly_audit", anomalies, mode="overwrite"))
 
+            # Also expose curated sub-kegiatan summary from Monitoring when eBudgeting is not loaded
+            if eb_arrow is None:
+                mon_sub = con.sql(
+                    """
+                    SELECT
+                        nama_opd,
+                        kode_sub_kegiatan,
+                        nama_sub_kegiatan,
+                        COUNT(*)::BIGINT AS jumlah_pekerjaan,
+                        COALESCE(SUM(alokasi_rp), 0)::BIGINT AS total_anggaran_rp,
+                        COALESCE(SUM(sp2d_rp), 0)::BIGINT AS total_sp2d_rp
+                    FROM silver_mon
+                    WHERE nama_opd IS NOT NULL AND nama_opd <> ''
+                    GROUP BY nama_opd, kode_sub_kegiatan, nama_sub_kegiatan
+                    ORDER BY total_anggaran_rp DESC
+                    """
+                ).to_arrow_table()
+                results.append(_write_iceberg_table(catalog, "gold.apbd_subkegiatan_summary", mon_sub, mode="overwrite"))
+
         elif eb_arrow is not None:
             con.register("silver_eb", eb_arrow)
+            has_pak_opd = con.execute("SELECT COUNT(*) FROM silver_eb WHERE LOWER(tahap) = 'pak'").fetchall()[0][0] > 0
+            tahap_opd = "LOWER(tahap) = 'pak'" if has_pak_opd else "TRUE"
             opd_summary = con.sql(
-                """
+                f"""
                 SELECT
                     nama_opd,
                     COUNT(DISTINCT kode_sub_kegiatan) AS jumlah_sub_kegiatan,
@@ -249,7 +347,7 @@ def _rebuild_gold_layers(catalog: SqlCatalog) -> list[dict[str, Any]]:
                     0.0::DOUBLE AS serapan_sp2d_pct,
                     0::BIGINT AS jumlah_anomali
                 FROM silver_eb
-                WHERE nama_opd IS NOT NULL AND nama_opd <> ''
+                WHERE nama_opd IS NOT NULL AND nama_opd <> '' AND {tahap_opd}
                 GROUP BY nama_opd
                 ORDER BY alokasi_rp DESC
                 """
@@ -260,6 +358,62 @@ def _rebuild_gold_layers(catalog: SqlCatalog) -> list[dict[str, Any]]:
             con.register("silver_eb_t", eb_arrow)
             has_pak = con.execute("SELECT COUNT(*) FROM silver_eb_t WHERE LOWER(tahap) = 'pak'").fetchall()[0][0] > 0
             tahap_filter = "LOWER(tahap) = 'pak'" if has_pak else "TRUE"
+
+            # 1. Full curated Gold detail table (preserves all PAK/active rows & detail columns for BI, SQL, & Chatbot)
+            eb_curated = con.sql(
+                f"""
+                SELECT
+                    nama_opd,
+                    kode_detail_kegiatan,
+                    kode_sub_kegiatan,
+                    nama_sub_kegiatan,
+                    nama_subtitle,
+                    nama_komponen,
+                    nama_detil,
+                    satuan,
+                    volume,
+                    koefisien,
+                    harga_satuan_rp,
+                    pajak_pct,
+                    hasil_rp,
+                    anggaran_rasionalisasi_rp,
+                    sumber_dana,
+                    rekening,
+                    nama_rekening,
+                    tahap,
+                    is_pendidikan,
+                    is_kesehatan,
+                    is_infrastruktur,
+                    is_stunting,
+                    is_miskin,
+                    is_inflasi
+                FROM silver_eb_t
+                WHERE {tahap_filter}
+                ORDER BY hasil_rp DESC
+                """
+            ).to_arrow_table()
+            results.append(_write_iceberg_table(catalog, "gold.ebudgeting_curated", eb_curated, mode="overwrite"))
+
+            # 2. Sub-kegiatan summary mart (41 sub-kegiatan for Dispendik) — great for drill-down & Vector AI
+            eb_sub = con.sql(
+                f"""
+                SELECT
+                    nama_opd,
+                    kode_sub_kegiatan,
+                    nama_sub_kegiatan,
+                    COUNT(*)::BIGINT AS jumlah_komponen,
+                    COALESCE(SUM(hasil_rp), 0)::BIGINT AS total_anggaran_rp,
+                    STRING_AGG(DISTINCT NULLIF(sumber_dana, ''), ', ') AS sumber_dana,
+                    STRING_AGG(DISTINCT NULLIF(nama_subtitle, ''), '; ') AS daftar_subtitle
+                FROM silver_eb_t
+                WHERE {tahap_filter}
+                GROUP BY nama_opd, kode_sub_kegiatan, nama_sub_kegiatan
+                ORDER BY total_anggaran_rp DESC
+                """
+            ).to_arrow_table()
+            results.append(_write_iceberg_table(catalog, "gold.apbd_subkegiatan_summary", eb_sub, mode="overwrite"))
+
+            # 3. Thematic priority mart
             tematik = con.sql(
                 f"""
                 WITH scoped AS (SELECT * FROM silver_eb_t WHERE {tahap_filter})
@@ -287,7 +441,6 @@ def _ingest_monitoring_excel(
     catalog: SqlCatalog, ws: Any, filename: str, sha256: str, ingested_at: str
 ) -> dict[str, Any]:
     rows_raw: list[dict[str, Any]] = []
-    rows_silver: list[dict[str, Any]] = []
     periode = ""
 
     for idx, row in enumerate(ws.iter_rows(values_only=True)):
@@ -343,49 +496,17 @@ def _ingest_monitoring_excel(
             }
         )
 
-        kode_std, internal_id = _parse_sub_kegiatan_id(id_sub_raw)
-        nama_sub_clean, nama_ppkm = _split_sub_kegiatan_ppkm(nama_sub_raw)
-        dq_flags: list[str] = []
-        if renc_fisik > 100.0 or real_fisik > 100.0:
-            dq_flags.append("FISIK_OVER_100")
-        if alokasi > 0 and sp2d > alokasi:
-            dq_flags.append("SP2D_OVER_ALOKASI")
-
-        rows_silver.append(
-            {
-                "nama_opd": pd_name,
-                "kode_sub_kegiatan": kode_std,
-                "sub_kegiatan_internal_id": internal_id or 0,
-                "nama_sub_kegiatan": nama_sub_clean,
-                "nama_ppkm": nama_ppkm,
-                "id_pekerjaan": str(r[3]) if r[3] is not None else "",
-                "nama_pekerjaan": str(r[4]).strip() if r[4] is not None else "",
-                "metode_pekerjaan": str(r[9]).strip() if r[9] is not None else "",
-                "alokasi_rp": alokasi,
-                "penggunaan_dana_rp": penggunaan,
-                "rencana_fisik_pct": renc_fisik,
-                "total_realisasi_rp": tot_real,
-                "sp2d_rp": sp2d,
-                "rekanan": str(r[22]).strip() if r[22] is not None else "",
-                "nilai_kontrak_rp": nilai_kontrak,
-                "dq_flag": ",".join(dq_flags),
-                "periode_laporan": periode,
-            }
-        )
-
+    if not rows_raw:
+        raise ValueError("File Monitoring tidak memiliki baris data yang valid.")
     bronze_res = _write_iceberg_table(
         catalog, "bronze.monitoring_pd_raw", pa.Table.from_pylist(rows_raw), mode="overwrite"
     )
-    silver_res = _write_iceberg_table(
-        catalog, "silver.monitoring_pekerjaan", pa.Table.from_pylist(rows_silver), mode="overwrite"
-    )
-    gold_res = _rebuild_gold_layers(catalog)
     return {
         "detected": "monitoring_semua_pd",
         "target_table": "bronze.monitoring_pd_raw",
         "rows_extracted": len(rows_raw),
         "status": "Committed",
-        "layers_written": [bronze_res, silver_res, *gold_res],
+        "layers_written": [bronze_res],
     }
 
 
@@ -401,7 +522,6 @@ def _ingest_ebudgeting_excel(
         return row[i] if i is not None and i < len(row) else None
 
     rows_raw: list[dict[str, Any]] = []
-    rows_silver: list[dict[str, Any]] = []
 
     for row in rows_iter:
         if not row or not any(row):
@@ -421,61 +541,46 @@ def _ingest_ebudgeting_excel(
                 "kode_sub_kegiatan": str(get(row, "kode_sub_kegiatan") or ""),
                 "kegiatan_id": kegiatan_id,
                 "nama_sub_kegiatan": str(get(row, "nama_sub_kegiatan") or ""),
+                "kode_subtitle": str(get(row, "kode_subtitle") or ""),
                 "nama_subtitle": str(get(row, "nama_subtitle") or ""),
                 "id_komponen": str(get(row, "id_komponen") or ""),
                 "nama_komponen": str(get(row, "nama_komponen") or ""),
+                "nama_detil": str(get(row, "nama_detil") or ""),
                 "satuan": str(get(row, "satuan") or ""),
                 "volume": vol,
+                "koefisien": str(get(row, "koefisien") or ""),
                 "harga_satuan": harga,
                 "hasil": hasil_rp,
+                "pajak": _to_float(get(row, "pajak")) or 0.0,
                 "anggaran_rasionalisasi": rasio_rp,
                 "sumber_dana": str(get(row, "sumber_dana") or ""),
                 "rekening": str(get(row, "rekening") or ""),
                 "nama_rekening": str(get(row, "nama_rekening") or ""),
                 "tahap": str(get(row, "tahap") or ""),
-                "_source_file": filename,
-                "_sha256": sha256[:12],
-                "_ingested_at": ingested_at,
-            }
-        )
-
-        rows_silver.append(
-            {
-                "nama_opd": skpd,
-                "kode_sub_kegiatan": kegiatan_id,
-                "nama_sub_kegiatan": str(get(row, "nama_sub_kegiatan") or ""),
-                "nama_komponen": str(get(row, "nama_komponen") or ""),
-                "satuan": str(get(row, "satuan") or ""),
-                "volume": vol,
-                "harga_satuan_rp": harga,
-                "hasil_rp": hasil_rp,
-                "anggaran_rasionalisasi_rp": rasio_rp,
-                "sumber_dana": str(get(row, "sumber_dana") or ""),
-                "rekening": str(get(row, "rekening") or ""),
-                "nama_rekening": str(get(row, "nama_rekening") or ""),
-                "tahap": str(get(row, "tahap") or ""),
+                "user_id": str(get(row, "user_id") or ""),
                 "is_pendidikan": _to_bool(get(row, "is_pendidikan")),
                 "is_kesehatan": _to_bool(get(row, "is_kesehatan")),
                 "is_infrastruktur": _to_bool(get(row, "is_infrastruktur")),
                 "is_stunting": _to_bool(get(row, "is_stunting")),
                 "is_miskin": _to_bool(get(row, "is_miskin")),
                 "is_inflasi": _to_bool(get(row, "is_inflasi")),
+                "_source_file": filename,
+                "_sha256": sha256[:12],
+                "_ingested_at": ingested_at,
             }
         )
 
+    if not rows_raw:
+        raise ValueError("File eBudgeting tidak memiliki baris data yang valid.")
     bronze_res = _write_iceberg_table(
         catalog, "bronze.ebudgeting_rincian_raw", pa.Table.from_pylist(rows_raw), mode="overwrite"
     )
-    silver_res = _write_iceberg_table(
-        catalog, "silver.ebudgeting_rincian", pa.Table.from_pylist(rows_silver), mode="overwrite"
-    )
-    gold_res = _rebuild_gold_layers(catalog)
     return {
         "detected": "ebudgeting_rincian",
         "target_table": "bronze.ebudgeting_rincian_raw",
         "rows_extracted": len(rows_raw),
         "status": "Committed",
-        "layers_written": [bronze_res, silver_res, *gold_res],
+        "layers_written": [bronze_res],
     }
 
 
@@ -568,6 +673,18 @@ def ingest_uploaded_file(filename: str, content: bytes) -> dict[str, Any]:
                         "ingested_at": ingested_at,
                     }
                 )
+        if not pages_data:
+            pages_data.append(
+                {
+                    "source_file": filename,
+                    "sha256": sha256[:12],
+                    "page_number": 0,
+                    "char_count": 0,
+                    "text_excerpt": "",
+                    "needs_ocr": True,
+                    "ingested_at": ingested_at,
+                }
+            )
         w = _write_iceberg_table(catalog, "bronze.pdf_documents_raw", pa.Table.from_pylist(pages_data), mode="append")
         res = {
             "detected": "pdf_document",
@@ -579,7 +696,18 @@ def ingest_uploaded_file(filename: str, content: bytes) -> dict[str, Any]:
         source_type = "pdf"
 
     else:
-        # Image or other binary -> bronze.media_assets_raw (Perlu Review OCR)
+        # Image or other binary -> extract text via local RapidOCR + store in bronze.media_assets_raw
+        ocr_text = ""
+        ocr_status = "PENDING_REVIEW"
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+            try:
+                from vector_store import extract_image_ocr
+
+                ocr_text = extract_image_ocr(raw_path)
+                ocr_status = "EXTRACTED" if ocr_text else "NO_TEXT"
+            except Exception:
+                ocr_status = "PENDING_REVIEW"
+
         rec = [
             {
                 "source_file": filename,
@@ -587,7 +715,8 @@ def ingest_uploaded_file(filename: str, content: bytes) -> dict[str, Any]:
                 "size_bytes": len(content),
                 "sha256": sha256[:12],
                 "raw_path": str(raw_path.relative_to(ROOT_DIR)),
-                "ocr_status": "PENDING_REVIEW",
+                "ocr_text": ocr_text[:4000],
+                "ocr_status": ocr_status,
                 "ingested_at": ingested_at,
             }
         ]
@@ -596,7 +725,7 @@ def ingest_uploaded_file(filename: str, content: bytes) -> dict[str, Any]:
             "detected": "media_image",
             "target_table": "bronze.media_assets_raw",
             "rows_extracted": 1,
-            "status": "Perlu Review",
+            "status": "Committed" if ocr_status == "EXTRACTED" else "Perlu Review",
             "layers_written": [w],
         }
         source_type = "image"
@@ -616,12 +745,14 @@ def ingest_uploaded_file(filename: str, content: bytes) -> dict[str, Any]:
 
 
 def ingest_web_url(url: str) -> dict[str, Any]:
+    _validate_public_url(url)
     ensure_warehouse()
     catalog = get_catalog()
     ingested_at = _now_iso()
 
     with httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": "SuraLake-Harvester/0.1"}) as client:
         resp = client.get(url)
+        _validate_public_url(str(resp.url))
         resp.raise_for_status()
         html = resp.text
 
@@ -692,17 +823,22 @@ def get_catalog_summary() -> dict[str, Any]:
             full_name = f"{ns}.{tbl_name}"
             tbl = catalog.load_table(full_name)
             snap = tbl.current_snapshot()
-            arrow = tbl.scan().to_arrow()
 
-            # Compute parquet size on disk from inspect.files()
+            # Read row count and size from Iceberg metadata (avoids scanning full Parquet files)
             files_df = tbl.inspect.files().to_pylist()
             size_bytes = sum(int(f.get("file_size_in_bytes", 0)) for f in files_df)
+            row_count = sum(int(f.get("record_count", 0)) for f in files_df)
+            sample_arrow = tbl.scan(limit=1).to_arrow() if row_count > 0 else None
 
             cols = [
                 {
                     "name": field.name,
                     "type": str(field.field_type),
-                    "sample": str(arrow.column(field.name)[0].as_py())[:60] if arrow.num_rows > 0 else "—",
+                    "sample": (
+                        str(sample_arrow.column(field.name)[0].as_py())[:60]
+                        if sample_arrow is not None and sample_arrow.num_rows > 0
+                        else "—"
+                    ),
                 }
                 for field in tbl.schema().fields
             ]
@@ -720,7 +856,7 @@ def get_catalog_summary() -> dict[str, Any]:
                     "name": full_name,
                     "layer": ns,
                     "format": "Iceberg v2 · Parquet",
-                    "rows": arrow.num_rows,
+                    "rows": row_count,
                     "files": len(files_df),
                     "sizeMb": round(size_bytes / (1024 * 1024), 3),
                     "snapshotId": str(snap.snapshot_id) if snap else "—",
@@ -800,12 +936,7 @@ def get_overview_data() -> dict[str, Any]:
 
 
 def run_duckdb_sql(query: str) -> dict[str, Any]:
-    q = query.strip()
-    if not q:
-        raise ValueError("Query SQL tidak boleh kosong.")
-    first_word = q.split()[0].upper()
-    if first_word not in ("SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN", "PRAGMA"):
-        raise ValueError("Hanya query baca (SELECT / WITH / SHOW / DESCRIBE) yang diizinkan di SQL Explorer.")
+    q = _validate_readonly_sql(query)
 
     catalog = get_catalog()
     con = duckdb.connect()
@@ -823,6 +954,8 @@ def run_duckdb_sql(query: str) -> dict[str, Any]:
                     con.execute(f"CREATE OR REPLACE VIEW {full_name} AS SELECT * FROM {alias}")
                     registered.append(full_name)
 
+        # Sandbox DuckDB so user/LLM SQL cannot touch local filesystem or network
+        con.execute("SET enable_external_access = false")
         rel = con.execute(q)
         cols = [d[0] for d in rel.description] if rel.description else []
         raw_rows = rel.fetchmany(500)
@@ -840,10 +973,11 @@ def run_duckdb_sql(query: str) -> dict[str, Any]:
 
 
 def reset_warehouse() -> dict[str, Any]:
-    if WAREHOUSE_DIR.exists():
-        shutil.rmtree(WAREHOUSE_DIR)
-    get_catalog()
-    return {"status": "reset", "message": "Warehouse Apache Iceberg dikosongkan kembali."}
+    with _WAREHOUSE_LOCK:
+        if WAREHOUSE_DIR.exists():
+            shutil.rmtree(WAREHOUSE_DIR)
+        get_catalog()
+        return {"status": "reset", "message": "Warehouse Apache Iceberg dikosongkan kembali."}
 
 
 # ---------- CRUD & MEDALLION PROMOTION ----------
@@ -980,12 +1114,19 @@ def delete_table_row(namespace: str, table: str, row_idx: int) -> dict[str, Any]
 
 def drop_iceberg_table(namespace: str, table: str) -> dict[str, Any]:
     ident = _validate_table_ident(namespace, table)
-    catalog = get_catalog()
-    if not catalog.table_exists(ident):
-        raise ValueError(f"Tabel {ident} tidak ditemukan.")
-    catalog.drop_table(ident)
-    gold_rebuilt = _rebuild_gold_layers(catalog) if namespace == "silver" else []
-    return {"status": "dropped", "table": ident, "goldRebuilt": gold_rebuilt}
+    with _WAREHOUSE_LOCK:
+        catalog = get_catalog()
+        if not catalog.table_exists(ident):
+            raise ValueError(f"Tabel {ident} tidak ditemukan.")
+        catalog.drop_table(ident)
+        if namespace == "gold":
+            try:
+                from vector_store import remove_table_vectors
+
+                remove_table_vectors(ident)
+            except Exception:
+                pass
+        return {"status": "dropped", "table": ident, "goldRebuilt": []}
 
 
 def promote_bronze_to_silver(
@@ -1049,12 +1190,17 @@ def promote_bronze_to_silver(
             silver_rows.append(
                 {
                     "nama_opd": str(r.get("nama_skpd") or "").strip(),
+                    "kode_detail_kegiatan": str(r.get("kode_detail_kegiatan") or "").strip(),
                     "kode_sub_kegiatan": str(r.get("kegiatan_id") or "").strip(),
                     "nama_sub_kegiatan": str(r.get("nama_sub_kegiatan") or "").strip(),
+                    "nama_subtitle": str(r.get("nama_subtitle") or "").strip(),
                     "nama_komponen": str(r.get("nama_komponen") or "").strip(),
+                    "nama_detil": str(r.get("nama_detil") or "").strip(),
                     "satuan": str(r.get("satuan") or "").strip(),
                     "volume": _to_float(r.get("volume")) or 0.0,
+                    "koefisien": str(r.get("koefisien") or "").strip(),
                     "harga_satuan_rp": _to_int(r.get("harga_satuan")) or 0,
+                    "pajak_pct": _to_float(r.get("pajak")) or 0.0,
                     "hasil_rp": _to_int(r.get("hasil")) or 0,
                     "anggaran_rasionalisasi_rp": _to_int(r.get("anggaran_rasionalisasi")) or 0,
                     "sumber_dana": str(r.get("sumber_dana") or "").strip(),
@@ -1108,12 +1254,11 @@ def promote_bronze_to_silver(
             mode="overwrite",
         )
 
-    gold_res = _rebuild_gold_layers(catalog)
     return {
         "status": "promoted",
         "source": source_table,
         "silver": silver_res,
-        "gold": gold_res,
+        "gold": [],
     }
 
 
@@ -1142,37 +1287,48 @@ def promote_silver_to_gold(
             "gold": gold_res,
         }
 
-    # Generic Silver -> Gold: group by first string column if numeric columns exist, else curated copy
+    # Generic Silver -> Gold:
+    # - Document/Web/Media tables (containing link_href, text_excerpt, or ocr_text) keep curated rows intact for Gold & Vector AI
+    # - Tabular numeric tables group by first string dimension column
+    col_names = {f.name for f in silver_arrow.schema}
     con = duckdb.connect()
     try:
         con.register("src_silver", silver_arrow)
-        str_cols = [
-            f.name
-            for f in silver_arrow.schema
-            if pa.types.is_string(f.type) and not f.name.startswith("_") and f.name != "dq_flag"
-        ]
-        num_cols = [
-            f.name
-            for f in silver_arrow.schema
-            if (pa.types.is_integer(f.type) or pa.types.is_floating(f.type))
-            and not f.name.startswith("_")
-        ]
-
-        if str_cols and num_cols:
-            dim = str_cols[0]
-            aggs = ", ".join([f'COALESCE(SUM("{c}"), 0) AS total_{c}' for c in num_cols[:5]])
-            gold_arrow = con.sql(
-                f'SELECT "{dim}", COUNT(*)::BIGINT AS jumlah_baris, {aggs} '
-                f'FROM src_silver GROUP BY "{dim}" ORDER BY jumlah_baris DESC'
-            ).to_arrow_table()
-        elif str_cols:
-            dim = str_cols[0]
-            gold_arrow = con.sql(
-                f'SELECT "{dim}", COUNT(*)::BIGINT AS jumlah_baris '
-                f'FROM src_silver GROUP BY "{dim}" ORDER BY jumlah_baris DESC'
-            ).to_arrow_table()
+        if col_names & {"link_href", "text_excerpt", "ocr_text"}:
+            keep_cols = [
+                f'"{f.name}"'
+                for f in silver_arrow.schema
+                if not f.name.startswith("_") and f.name != "dq_flag"
+            ]
+            gold_arrow = con.sql(f"SELECT {', '.join(keep_cols)} FROM src_silver").to_arrow_table()
         else:
-            gold_arrow = silver_arrow
+            str_cols = [
+                f.name
+                for f in silver_arrow.schema
+                if pa.types.is_string(f.type) and not f.name.startswith("_") and f.name != "dq_flag"
+            ]
+            num_cols = [
+                f.name
+                for f in silver_arrow.schema
+                if (pa.types.is_integer(f.type) or pa.types.is_floating(f.type))
+                and not f.name.startswith("_")
+            ]
+
+            if str_cols and num_cols:
+                dim = str_cols[0]
+                aggs = ", ".join([f'COALESCE(SUM("{c}"), 0) AS total_{c}' for c in num_cols[:5]])
+                gold_arrow = con.sql(
+                    f'SELECT "{dim}", COUNT(*)::BIGINT AS jumlah_baris, {aggs} '
+                    f'FROM src_silver GROUP BY "{dim}" ORDER BY jumlah_baris DESC'
+                ).to_arrow_table()
+            elif str_cols:
+                dim = str_cols[0]
+                gold_arrow = con.sql(
+                    f'SELECT "{dim}", COUNT(*)::BIGINT AS jumlah_baris '
+                    f'FROM src_silver GROUP BY "{dim}" ORDER BY jumlah_baris DESC'
+                ).to_arrow_table()
+            else:
+                gold_arrow = silver_arrow
     finally:
         con.close()
 
@@ -1191,9 +1347,7 @@ def promote_silver_to_gold(
 
 def save_sql_as_gold(query: str, table_name: str) -> dict[str, Any]:
     """Execute a read-only DuckDB SQL query and save its output as a Gold Iceberg table."""
-    q = query.strip().rstrip(";")
-    if not q:
-        raise ValueError("Query SQL tidak boleh kosong.")
+    q = _validate_readonly_sql(query)
     first_word = q.split()[0].upper()
     if first_word not in ("SELECT", "WITH"):
         raise ValueError("Hanya query SELECT / WITH yang bisa disimpan ke Gold.")
@@ -1219,6 +1373,7 @@ def save_sql_as_gold(query: str, table_name: str) -> dict[str, Any]:
                     con.register(alias, arrow)
                     con.execute(f"CREATE OR REPLACE VIEW {full_name} AS SELECT * FROM {alias}")
 
+        con.execute("SET enable_external_access = false")
         out_arrow = con.sql(q).to_arrow_table()
     finally:
         con.close()
