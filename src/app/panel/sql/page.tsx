@@ -75,12 +75,12 @@ export default function SqlExplorerPage() {
 
   const exportCsv = () => {
     if (!result) return;
-    const csv = [
-      result.columns.join(","),
-      ...result.rows.map((r) =>
-        r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")
-      ),
-    ].join("\n");
+    const cell = (v: string) => {
+      // A leading =, +, @ or non-numeric - would run as a formula in Excel.
+      const safe = /^[=+@\t\r]|^-(?!\d+(\.\d+)?$)/.test(v) ? `'${v}` : v;
+      return `"${safe.replace(/"/g, '""')}"`;
+    };
+    const csv = [result.columns, ...result.rows].map((r) => r.map(cell).join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -181,6 +181,13 @@ export default function SqlExplorerPage() {
             </span>
           )}
         </div>
+
+        {result?.truncated && (
+          <p className="mb-3 p-3 rounded-md bg-[var(--pill-warning-bg)] text-[var(--pill-warning-ink)] text-[13px]">
+            Hasil dipotong: hanya {result.rowCount} baris pertama yang ditampilkan dan diekspor. Persempit query
+            dengan WHERE, atau ambil bertahap dengan LIMIT dan OFFSET.
+          </p>
+        )}
 
         {error ? (
           <div className="p-3 rounded-md bg-[var(--pill-negative-bg)] text-[var(--pill-negative-ink)] text-[13px] font-mono-code">

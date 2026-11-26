@@ -17,8 +17,9 @@ import { fmtPct, fmtRp, type OpdSummaryRow } from "@/lib/api";
 type HealthFilter = "all" | "low" | "mid" | "high";
 
 function classifyHealth(o: OpdSummaryRow): "low" | "mid" | "high" {
-  if (o.serapan_sp2d_pct >= 70) return "high";
-  if (o.serapan_sp2d_pct >= 50) return "mid";
+  const pct = o.serapan_sp2d_pct ?? 0;
+  if (pct >= 70) return "high";
+  if (pct >= 50) return "mid";
   return "low";
 }
 
@@ -83,7 +84,9 @@ export default function OverviewPage() {
   const [healthFilter, setHealthFilter] = useState<HealthFilter>("all");
   const [showAll, setShowAll] = useState(false);
 
-  const sisaRp = Math.max(0, overview.totals.alokasiRp - overview.totals.sp2dRp);
+  // Without payment (SP2D) data every absorption chart would wrongly show zero, so hide them.
+  const hasSp2d = overview.totals.sp2dRp !== null;
+  const sisaRp = Math.max(0, overview.totals.alokasiRp - (overview.totals.sp2dRp ?? 0));
 
   const healthCounts = useMemo(() => {
     let low = 0;
@@ -108,7 +111,7 @@ export default function OverviewPage() {
     () =>
       [...overview.opd]
         .filter((o) => o.alokasi_rp > 0)
-        .sort((a, b) => a.serapan_sp2d_pct - b.serapan_sp2d_pct)
+        .sort((a, b) => (a.serapan_sp2d_pct ?? 0) - (b.serapan_sp2d_pct ?? 0))
         .slice(0, 5),
     [overview.opd]
   );
@@ -117,7 +120,7 @@ export default function OverviewPage() {
     () =>
       [...overview.opd]
         .filter((o) => o.alokasi_rp > 0)
-        .sort((a, b) => b.serapan_sp2d_pct - a.serapan_sp2d_pct)
+        .sort((a, b) => (b.serapan_sp2d_pct ?? 0) - (a.serapan_sp2d_pct ?? 0))
         .slice(0, 5),
     [overview.opd]
   );
@@ -151,6 +154,15 @@ export default function OverviewPage() {
               <span className="text-[var(--negative)]">{error}</span>
             ) : overview.isEmpty ? (
               "Belum ada data di Lakehouse. Unggah berkas Excel/CSV/PDF atau ambil dari website untuk mulai melihat visualisasi."
+            ) : !hasSp2d ? (
+              <>
+                Total anggaran{" "}
+                <strong className="font-medium text-[var(--text)]">
+                  {fmtRp(overview.totals.alokasiRp)}
+                </strong>{" "}
+                di {overview.totals.opdCount} dinas &amp; badan. Data pencairan (SP2D) belum diunggah,
+                jadi serapan belum bisa dihitung. Unggah berkas Monitoring Semua PD.
+              </>
             ) : (
               <>
                 Dari total anggaran{" "}
@@ -206,6 +218,8 @@ export default function OverviewPage() {
         </section>
       ) : (
         <>
+          {hasSp2d && (
+          <>
           {/* HERO VISUAL ROW: Left = Absorption Ring & Health Split, Right = Top 8 Biggest Budgets */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
             {/* Left: Ring & Plain-language breakdown */}
@@ -218,7 +232,7 @@ export default function OverviewPage() {
               </div>
 
               <div className="flex flex-col sm:flex-row items-center gap-5">
-                <AbsorptionRing pct={loading ? 0 : overview.totals.serapanPct} />
+                <AbsorptionRing pct={loading ? 0 : (overview.totals.serapanPct ?? 0)} />
                 <div className="flex-1 w-full flex flex-col gap-2.5 text-[14px]">
                   <div className="flex items-center justify-between border-b border-[var(--rule)] pb-2">
                     <span className="text-[var(--muted)]">Total Anggaran</span>
@@ -345,8 +359,8 @@ export default function OverviewPage() {
               <div className="flex flex-col gap-3">
                 {topBudgetOpd.map((o) => {
                   const totalWidthPct = Math.max(4, (o.alokasi_rp / maxAlokasi) * 100);
-                  const spentWithinBarPct = Math.min(100, o.serapan_sp2d_pct);
-                  const isLow = o.serapan_sp2d_pct < 50;
+                  const spentWithinBarPct = Math.min(100, o.serapan_sp2d_pct ?? 0);
+                  const isLow = (o.serapan_sp2d_pct ?? 0) < 50;
                   return (
                     <div key={o.nama_opd} className="flex flex-col gap-1">
                       <div className="flex items-baseline justify-between gap-2 text-[13px]">
@@ -419,7 +433,7 @@ export default function OverviewPage() {
                       <div className="w-full h-1.5 bg-[var(--rule)] rounded-full overflow-hidden">
                         <div
                           className="h-full bg-[var(--negative)]"
-                          style={{ width: `${Math.min(100, o.serapan_sp2d_pct)}%` }}
+                          style={{ width: `${Math.min(100, o.serapan_sp2d_pct ?? 0)}%` }}
                         />
                       </div>
                       <div className="text-[12px] text-[var(--muted)] tabular-nums">
@@ -456,7 +470,7 @@ export default function OverviewPage() {
                     <div className="w-full h-1.5 bg-[var(--rule)] rounded-full overflow-hidden">
                       <div
                         className="h-full bg-[var(--accent)]"
-                        style={{ width: `${Math.min(100, o.serapan_sp2d_pct)}%` }}
+                        style={{ width: `${Math.min(100, o.serapan_sp2d_pct ?? 0)}%` }}
                       />
                     </div>
                     <div className="text-[12px] text-[var(--muted)] tabular-nums">
@@ -467,6 +481,9 @@ export default function OverviewPage() {
               </div>
             </section>
           </div>
+
+          </>
+          )}
 
           {/* TEMATIK PRIORITAS VISUAL BARS */}
           {overview.tematik.length > 0 && (
@@ -548,7 +565,7 @@ export default function OverviewPage() {
             </div>
 
             {/* Filter chips */}
-            <div className="flex flex-wrap items-center gap-2 mb-4">
+            <div className={hasSp2d ? "flex flex-wrap items-center gap-2 mb-4" : "hidden"}>
               {(
                 [
                   { id: "all", label: `Semua (${overview.opd.length})` },
@@ -594,6 +611,7 @@ export default function OverviewPage() {
                           {o.nama_opd}
                         </div>
                         <span
+                          hidden={!hasSp2d}
                           className={`shrink-0 text-[11px] font-medium px-2 py-0.5 rounded ${
                             isLow
                               ? "bg-[var(--pill-negative-bg)] text-[var(--pill-negative-ink)]"
@@ -618,7 +636,7 @@ export default function OverviewPage() {
                       <div className="w-full h-2 bg-[var(--rule)] rounded-full overflow-hidden">
                         <div
                           className={`h-full ${isLow ? "bg-[var(--negative)]" : "bg-[var(--accent)]"}`}
-                          style={{ width: `${Math.min(100, o.serapan_sp2d_pct)}%` }}
+                          style={{ width: `${Math.min(100, o.serapan_sp2d_pct ?? 0)}%` }}
                         />
                       </div>
 
@@ -627,7 +645,9 @@ export default function OverviewPage() {
                         <span>
                           {o.jumlah_anomali > 0
                             ? `${o.jumlah_anomali.toLocaleString("id-ID")} catatan audit`
-                            : "Data bersih"}
+                            : hasSp2d
+                              ? "Data bersih"
+                              : "Belum diaudit"}
                         </span>
                       </div>
                     </div>
@@ -648,7 +668,7 @@ export default function OverviewPage() {
                   </thead>
                   <tbody>
                     {visibleOpd.map((o) => {
-                      const isLow = o.serapan_sp2d_pct < 50;
+                      const isLow = hasSp2d && (o.serapan_sp2d_pct ?? 0) < 50;
                       return (
                         <tr
                           key={o.nama_opd}

@@ -1,12 +1,18 @@
+import logging
+import threading
+import time
+from collections import defaultdict, deque
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
-from chatbot import chat_with_lakehouse, get_chat_status
+from chatbot import QuotaError, chat_with_lakehouse
 from vector_store import get_vector_stats, index_table_to_vectors, rebuild_all_vectors, search_vectors
 from lakehouse import (
+    StaleTableError,
     create_table_row,
     delete_table_row,
     drop_iceberg_table,
@@ -26,6 +32,19 @@ from lakehouse import (
 )
 
 app = FastAPI(title="SuraLake API — APBD Surabaya Apache Iceberg Lakehouse")
+
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # keep in step with next.config.ts
+CHAT_PER_MINUTE = 15
+log = logging.getLogger("suralake")
+
+
+@app.middleware("http")
+async def block_cross_site_writes(request: Request, call_next):
+    # Browsers set this header themselves; another website cannot fake it.
+    if request.method not in ("GET", "HEAD", "OPTIONS") and request.headers.get("sec-fetch-site") == "cross-site":
+        return JSONResponse({"detail": "Permintaan dari situs lain ditolak."}, status_code=403)
+    return await call_next(request)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,12 +84,16 @@ def ingest_logs():
 
 
 @app.post("/api/ingest/file")
-async def ingest_file(file: UploadFile = File(...)):
-    content = await file.read()
+def ingest_file(file: UploadFile = File(...)):  # plain def: runs in a thread, server stays responsive
+    content = file.file.read(MAX_UPLOAD_BYTES + 1)
     if not content:
         raise HTTPException(status_code=400, detail="File kosong.")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Ukuran berkas melebihi 50 MB.")
     try:
         return ingest_uploaded_file(file.filename or "upload.bin", content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Gagal memproses file: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Gagal memproses file: {exc}") from exc
 
@@ -130,17 +153,21 @@ def add_row(namespace: str, table: str, payload: RowPayload):
 
 
 @app.put("/api/tables/{namespace}/{table}/rows/{row_idx}")
-def edit_row(namespace: str, table: str, row_idx: int, payload: RowPayload):
+def edit_row(namespace: str, table: str, row_idx: int, payload: RowPayload, snapshot_id: str = Query(...)):
     try:
-        return update_table_row(namespace, table, row_idx, payload.data)
+        return update_table_row(namespace, table, row_idx, payload.data, snapshot_id)
+    except StaleTableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.delete("/api/tables/{namespace}/{table}/rows/{row_idx}")
-def remove_row(namespace: str, table: str, row_idx: int):
+def remove_row(namespace: str, table: str, row_idx: int, snapshot_id: str = Query(...)):
     try:
-        return delete_table_row(namespace, table, row_idx)
+        return delete_table_row(namespace, table, row_idx, snapshot_id)
+    except StaleTableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -192,29 +219,54 @@ def sql_save_gold(req: SaveGoldRequest):
 
 class ChatHistoryItem(BaseModel):
     role: str
-    content: str
+    content: str = Field(max_length=20000)
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: list[ChatHistoryItem] = []
+    message: str = Field(max_length=2000)
+    history: list[ChatHistoryItem] = Field(default=[], max_length=20)
 
 
-@app.get("/api/chat/status")
-def chat_status():
-    return get_chat_status()
+# shortcut: per-process memory; move to a shared store if the backend ever runs several workers.
+_chat_hits: defaultdict[str, deque[float]] = defaultdict(deque)
+_chat_lock = threading.Lock()
+
+
+def _check_chat_rate(request: Request) -> None:
+    # The Next.js proxy appends the real client address as the last X-Forwarded-For entry.
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[-1].strip()
+    client = forwarded or (request.client.host if request.client else "unknown")
+    now = time.monotonic()
+    with _chat_lock:
+        for key in [k for k, v in _chat_hits.items() if v and now - v[-1] > 60]:
+            del _chat_hits[key]
+        hits = _chat_hits[client]
+        while hits and now - hits[0] > 60:
+            hits.popleft()
+        if len(hits) >= CHAT_PER_MINUTE:
+            raise HTTPException(status_code=429, detail="Terlalu banyak pertanyaan. Coba lagi dalam satu menit.")
+        hits.append(now)
 
 
 @app.post("/api/chat")
-def chat_endpoint(req: ChatRequest):
+def chat_endpoint(req: ChatRequest, request: Request):
+    _check_chat_rate(request)
     try:
         return chat_with_lakehouse(
             req.message, [{"role": h.role, "content": h.content} for h in req.history]
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except QuotaError as exc:
+        log.warning("%s", exc)
+        raise HTTPException(
+            status_code=429, detail="Kuota asisten AI sedang penuh. Coba lagi sekitar satu menit lagi."
+        ) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        log.exception("chat failed")
+        raise HTTPException(
+            status_code=500, detail="Asisten AI sedang bermasalah. Silakan coba lagi sebentar."
+        ) from exc
 
 
 class VectorIndexRequest(BaseModel):
@@ -222,8 +274,8 @@ class VectorIndexRequest(BaseModel):
 
 
 class VectorSearchRequest(BaseModel):
-    query: str
-    top_k: int = 6
+    query: str = Field(max_length=2000)
+    top_k: int = Field(default=6, ge=1, le=20)
 
 
 @app.get("/api/vectors/stats")

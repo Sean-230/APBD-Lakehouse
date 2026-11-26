@@ -41,7 +41,7 @@ function MessageBody({ text }: { text: string }) {
   let i = 0;
 
   const renderInline = (line: string, keyPrefix: string) => {
-    const parts = line.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+    const parts = line.split(/(\*\*[^*]+\*\*|`[^`]+`|\*[^*\s](?:[^*]*[^*\s])?\*)/g);
     return parts.map((part, idx) => {
       if (part.startsWith("**") && part.endsWith("**")) {
         return (
@@ -59,6 +59,9 @@ function MessageBody({ text }: { text: string }) {
             {part.slice(1, -1)}
           </code>
         );
+      }
+      if (part.length > 2 && part.startsWith("*") && part.endsWith("*")) {
+        return <em key={`${keyPrefix}-${idx}`}>{part.slice(1, -1)}</em>;
       }
       return <React.Fragment key={`${keyPrefix}-${idx}`}>{part}</React.Fragment>;
     });
@@ -113,6 +116,25 @@ function MessageBody({ text }: { text: string }) {
               ))}
             </tbody>
           </table>
+        </div>
+      );
+      continue;
+    }
+
+    // Blockquote: show the quoted text as a normal paragraph with a side line
+    if (line.trim().startsWith(">")) {
+      const quoted: string[] = [];
+      while (i < lines.length && lines[i].trim().startsWith(">")) {
+        quoted.push(lines[i].trim().replace(/^>\s?/, ""));
+        i += 1;
+      }
+      blocks.push(
+        <div key={`q-${i}`} className="border-l-2 border-[var(--border)] pl-3 my-1.5 text-[var(--muted)]">
+          {quoted.map((q, idx) => (
+            <p key={idx} className="my-0.5">
+              {renderInline(q, `q-${i}-${idx}`)}
+            </p>
+          ))}
         </div>
       );
       continue;
@@ -198,7 +220,10 @@ export default function ChatbotHomePage() {
       role: "user",
       content: text,
     };
-    const nextHistory = messages.map((m) => ({ role: m.role, content: m.content }));
+    const nextHistory = messages
+      .filter((m) => !m.error)
+      .slice(-8)
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 20000) }));
     setMessages((prev) => [...prev, userMsg]);
     if (!customText) setInput("");
     setSending(true);
@@ -365,6 +390,7 @@ export default function ChatbotHomePage() {
         >
           <textarea
             rows={1}
+            maxLength={2000}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKeyDown}

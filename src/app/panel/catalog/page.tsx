@@ -36,6 +36,8 @@ export default function CatalogPage() {
   // Modal state for Create / Edit row
   const [modalMode, setModalMode] = useState<"create" | "edit" | null>(null);
   const [editingRowIdx, setEditingRowIdx] = useState<number | null>(null);
+  // Table version the edited row was read from; the server refuses the edit if it changed.
+  const [editingSnapshot, setEditingSnapshot] = useState("");
   const [formValues, setFormValues] = useState<Record<string, string>>({});
 
   const filtered = useMemo(() => {
@@ -132,6 +134,7 @@ export default function CatalogPage() {
     });
     setFormValues(init);
     setEditingRowIdx(Number(row._row_idx));
+    setEditingSnapshot(tableData.snapshotId);
     setModalMode("edit");
   };
 
@@ -140,15 +143,24 @@ export default function CatalogPage() {
     if (!selected || !modalMode) return;
     setBusyAction(true);
     setNotice(null);
+    // Send numbers as numbers, so "1.125" is never read as one thousand one hundred twenty five.
+    const payload: Record<string, unknown> = { ...formValues };
+    tableData?.columns.forEach((c) => {
+      const raw = formValues[c.name];
+      if (!/int|double|float/.test(c.type) || raw === undefined) return;
+      const num = Number(raw);
+      payload[c.name] =
+        raw === "" ? null : Number.isInteger(num) && !Number.isSafeInteger(num) ? raw : num;
+    });
     try {
       if (modalMode === "create") {
-        const res = await createTableRow(selected.name, formValues);
+        const res = await createTableRow(selected.name, payload);
         setNotice({
           type: "ok",
           text: `Baris ditambahkan ke ${selected.name} · Snapshot Iceberg baru: ${res.snapshot_id}`,
         });
       } else if (editingRowIdx !== null) {
-        const res = await updateTableRow(selected.name, editingRowIdx, formValues);
+        const res = await updateTableRow(selected.name, editingRowIdx, payload, editingSnapshot);
         setNotice({
           type: "ok",
           text: `Baris #${editingRowIdx} diperbarui di ${selected.name} · Snapshot baru: ${res.snapshot_id}`,
@@ -162,18 +174,19 @@ export default function CatalogPage() {
         type: "err",
         text: err instanceof Error ? err.message : "Gagal menyimpan baris.",
       });
+      await loadRows(selected.name, offset, rowSearch);
     } finally {
       setBusyAction(false);
     }
   };
 
   const handleDeleteRow = async (rowIdx: number) => {
-    if (!selected) return;
+    if (!selected || !tableData) return;
     if (!window.confirm(`Hapus baris #${rowIdx} dari ${selected.name}?`)) return;
     setBusyAction(true);
     setNotice(null);
     try {
-      const res = await deleteTableRow(selected.name, rowIdx);
+      const res = await deleteTableRow(selected.name, rowIdx, tableData.snapshotId);
       setNotice({
         type: "ok",
         text: `Baris #${rowIdx} dihapus dari ${selected.name} · Snapshot baru: ${res.snapshot_id}`,
@@ -185,6 +198,7 @@ export default function CatalogPage() {
         type: "err",
         text: err instanceof Error ? err.message : "Gagal menghapus baris.",
       });
+      await loadRows(selected.name, offset, rowSearch);
     } finally {
       setBusyAction(false);
     }
@@ -226,7 +240,7 @@ export default function CatalogPage() {
       const res = await promoteBronzeToSilver(targetSrc);
       setNotice({
         type: "ok",
-        text: `Promosi sukses: ${targetSrc} -> ${res.silver.table} (${res.silver.rows.toLocaleString("id-ID")} baris, snapshot ${res.silver.snapshot_id}). Gold ikut diperbarui.`,
+        text: `Promosi sukses: ${targetSrc} -> ${res.silver.table} (${res.silver.rows.toLocaleString("id-ID")} baris, snapshot ${res.silver.snapshot_id}). Lanjutkan "Ke Gold" untuk memperbarui ringkasan.`,
       });
       await refreshAll();
       setSelectedName(res.silver.table);
@@ -374,7 +388,7 @@ export default function CatalogPage() {
         onSelectTable={handleSelectTable}
         onPromoteBronze={(tbl) => handlePromoteToSilver(tbl)}
         onPromoteSilver={(tbl) => handlePromoteToGold(tbl)}
-        onVectorUpdated={(msg) => setNotice({ type: "ok", text: msg })}
+        onVectorUpdated={(msg, type = "ok") => setNotice({ type, text: msg })}
       />
 
       <div className="flex items-center gap-5 border-b border-[var(--border)]" role="tablist">

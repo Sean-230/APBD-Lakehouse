@@ -222,13 +222,9 @@ export default function IngestPage() {
                         <span className="inline-flex items-center h-5.5 px-2 rounded text-[12px] font-medium bg-[var(--pill-positive-bg)] text-[var(--pill-positive-ink)]">
                           Committed
                         </span>
-                      ) : r.status === "Perlu Review" ? (
+                      ) : (
                         <span className="inline-flex items-center h-5.5 px-2 rounded text-[12px] font-medium bg-[var(--pill-warning-bg)] text-[var(--pill-warning-ink)]">
                           Perlu Review
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center h-5.5 px-2 rounded text-[12px] font-medium bg-[var(--pill-neutral-bg)] text-[var(--pill-neutral-ink)]">
-                          Unchanged
                         </span>
                       )}
                     </td>

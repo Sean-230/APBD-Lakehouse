@@ -6,9 +6,10 @@ export interface OpdSummaryRow {
   jumlah_pekerjaan: number;
   alokasi_rp: number;
   penggunaan_dana_rp: number;
-  total_realisasi_rp: number;
-  sp2d_rp: number;
-  serapan_sp2d_pct: number;
+  // null = payment (SP2D) data has not been uploaded
+  total_realisasi_rp: number | null;
+  sp2d_rp: number | null;
+  serapan_sp2d_pct: number | null;
   jumlah_anomali: number;
 }
 
@@ -22,9 +23,9 @@ export interface OverviewResponse {
   isEmpty: boolean;
   totals: {
     alokasiRp: number;
-    realisasiRp: number;
-    sp2dRp: number;
-    serapanPct: number;
+    realisasiRp: number | null;
+    sp2dRp: number | null;
+    serapanPct: number | null;
     opdCount: number;
     anomaliCount: number;
     tableCount: number;
@@ -74,7 +75,7 @@ export interface IngestRecord {
   sha256: string;
   rowsExtracted: number;
   ingestedAt: string;
-  status: "Committed" | "Perlu Review" | "Unchanged";
+  status: "Committed" | "Perlu Review";
 }
 
 export interface SqlResponse {
@@ -82,7 +83,7 @@ export interface SqlResponse {
   rows: string[][];
   rowCount: number;
   elapsedMs: number;
-  registeredTables: string[];
+  truncated: boolean;
 }
 
 export const EMPTY_OVERVIEW: OverviewResponse = {
@@ -106,7 +107,8 @@ export const EMPTY_OVERVIEW: OverviewResponse = {
   latestSnapshotId: null,
 };
 
-export function fmtRp(rp: number): string {
+export function fmtRp(rp: number | null): string {
+  if (rp === null) return "—";
   if (rp === 0) return "Rp 0";
   const abs = Math.abs(rp);
   if (abs >= 1e12) return `Rp ${(rp / 1e12).toFixed(2).replace(".", ",")} T`;
@@ -115,7 +117,8 @@ export function fmtRp(rp: number): string {
   return `Rp ${rp.toLocaleString("id-ID")}`;
 }
 
-export function fmtPct(v: number): string {
+export function fmtPct(v: number | null): string {
+  if (v === null) return "—";
   return `${v.toFixed(1).replace(".", ",")}%`;
 }
 
@@ -145,7 +148,7 @@ async function parseApiJson(res: Response) {
   } catch {
     if (res.status >= 500) {
       throw new Error(
-        "Backend FastAPI (port 8000) belum berjalan atau tidak merespons. Jalankan: cd backend && source .venv/bin/activate && uvicorn main:app --port 8000 --reload"
+        "Backend tidak merespons. Bisa jadi proses masih berjalan terlalu lama (muat ulang halaman sebentar lagi), atau backend FastAPI (port 8000) mati."
       );
     }
     throw new Error(text.slice(0, 160) || `HTTP ${res.status}`);
@@ -194,6 +197,7 @@ export interface TableRowsResponse {
   table: string;
   layer: MedallionLayer;
   columns: { name: string; type: string }[];
+  snapshotId: string;
   totalRows: number;
   filteredRows: number;
   offset: number;
@@ -236,10 +240,11 @@ export async function createTableRow(fullName: string, rowData: Record<string, u
 export async function updateTableRow(
   fullName: string,
   rowIdx: number,
-  rowData: Record<string, unknown>
+  rowData: Record<string, unknown>,
+  snapshotId: string
 ) {
   const [ns, tbl] = splitIdent(fullName);
-  const res = await fetch(`/api/tables/${ns}/${tbl}/rows/${rowIdx}`, {
+  const res = await fetch(`/api/tables/${ns}/${tbl}/rows/${rowIdx}?snapshot_id=${snapshotId}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ data: rowData }),
@@ -249,9 +254,11 @@ export async function updateTableRow(
   return data;
 }
 
-export async function deleteTableRow(fullName: string, rowIdx: number) {
+export async function deleteTableRow(fullName: string, rowIdx: number, snapshotId: string) {
   const [ns, tbl] = splitIdent(fullName);
-  const res = await fetch(`/api/tables/${ns}/${tbl}/rows/${rowIdx}`, { method: "DELETE" });
+  const res = await fetch(`/api/tables/${ns}/${tbl}/rows/${rowIdx}?snapshot_id=${snapshotId}`, {
+    method: "DELETE",
+  });
   const data = await parseApiJson(res);
   if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
   return data;
@@ -305,12 +312,6 @@ export async function saveSqlAsGold(query: string, tableName: string) {
   return data;
 }
 
-export interface ChatStatusResponse {
-  configured: boolean;
-  provider: string;
-  model: string;
-}
-
 export interface ChatSqlTrace {
   query: string;
   reason?: string;
@@ -324,13 +325,6 @@ export interface ChatResponse {
   model: string;
   sqlUsed: ChatSqlTrace[];
   snapshotId: string | null;
-}
-
-export async function fetchChatStatus(): Promise<ChatStatusResponse> {
-  const res = await fetch("/api/chat/status", { cache: "no-store" });
-  const data = await parseApiJson(res);
-  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-  return data;
 }
 
 export async function sendChatMessage(

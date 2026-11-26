@@ -26,7 +26,7 @@ interface MedallionFlowCanvasProps {
   onSelectTable: (name: string) => void;
   onPromoteBronze: (tableName: string) => Promise<void>;
   onPromoteSilver: (tableName: string) => Promise<void>;
-  onVectorUpdated: (message: string) => void;
+  onVectorUpdated: (message: string, type?: "ok" | "err") => void;
 }
 
 interface FlowStepState {
@@ -108,7 +108,7 @@ export function MedallionFlowCanvas({
     }
   };
 
-  const tableSignature = useMemo(() => tables.map((t) => `${t.name}:${t.rows}`).join("|"), [tables]);
+  const tableSignature = useMemo(() => tables.map((t) => `${t.name}:${t.snapshotId}`).join("|"), [tables]);
 
   useEffect(() => {
     loadVectorStats();
@@ -211,7 +211,8 @@ export function MedallionFlowCanvas({
     } catch (err) {
       setFlowStep(null);
       onVectorUpdated(
-        err instanceof Error ? `Gagal indexing vector: ${err.message}` : "Gagal indexing vector."
+        err instanceof Error ? `Gagal indexing vector: ${err.message}` : "Gagal indexing vector.",
+        "err"
       );
     } finally {
       setVectorBusy(false);
@@ -225,6 +226,8 @@ export function MedallionFlowCanvas({
     try {
       const res = await searchVectorsApi(testQuery.trim(), 4);
       setTestResult(res);
+    } catch (err) {
+      onVectorUpdated(err instanceof Error ? `Gagal mencari: ${err.message}` : "Gagal mencari.", "err");
     } finally {
       setSearching(false);
     }

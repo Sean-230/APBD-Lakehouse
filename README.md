@@ -90,6 +90,14 @@ GROQ_API_KEY=gsk_isi_api_key_groq_anda
 GROQ_MODEL=openai/gpt-oss-120b
 ```
 
+Buat juga file `.env.local` di root proyek. Tanpa kata sandi ini, `/panel` dan semua API selain chat terkunci:
+
+```env
+ADMIN_PASSWORD=ganti_dengan_kata_sandi_kuat
+```
+
+Saat browser meminta login, nama pengguna boleh apa saja.
+
 ### 2. Jalankan Backend (FastAPI — Port `8000`)
 ```bash
 cd backend
@@ -115,12 +123,25 @@ npm run dev
 
 ---
 
+### Menjalankan Test Backend
+```bash
+cd backend && .venv/bin/python -m unittest -v
+```
+
+### Catatan untuk Docker / Server
+- Publikasikan **hanya port frontend**. Port backend `8000` tidak punya login, jadi jangan dibuka ke jaringan.
+- Di container frontend, set `BACKEND_URL` **saat build** dan `ADMIN_PASSWORD` **saat jalan**, lalu build ulang image setelah memperbarui kode.
+- Jalankan backend dengan **satu worker** uvicorn.
+- Index vector untuk ±10.000 baris butuh sekitar 2 menit dan 1,5 GB RAM di laptop; sediakan minimal 2 GB untuk container backend.
+
+---
+
 ## Alur Penggunaan Data
 
 1. Buka **`/panel/ingest`**, unggah berkas (`Monitoring Semua PD.xlsx`, `Tabel eBudgeting.xlsx`, CSV, PDF, gambar) atau masukkan URL web → data masuk ke **1. BRONZE**.
 2. Buka **`/panel/catalog`**, pada papan visual klik **“Ke Silver →”** untuk membersihkan, menormalisasi kode, dan menandai anomali data → masuk ke **2. SILVER**.
 3. Klik **“Ke Gold →”** pada kartu Silver untuk menyusun data mart ringkasan & detail terkurasi (khusus tahap `PAK` agar bebas *double-counting*) → masuk ke **3. GOLD**.
-4. Klik **“Ke Vector →”** (atau **“Index Semua Gold ke Vector”**) agar data Gold terindeks ke **4. VECTOR AI**.
+4. Klik **“Ke Vector →”** (atau **“Index Semua Gold ke Vector”**) agar data Gold terindeks ke **4. VECTOR AI**. Satu baris menjadi satu *chunk* (teks PDF/OCR yang panjang menjadi beberapa chunk). Setelah tabel Gold berubah, index ulang karena vector lamanya dihapus otomatis.
 5. Buka **`/`** dan tanyakan apa saja soal APBD Surabaya ke **SuraLake AI**.
 
 ---
@@ -128,6 +149,6 @@ npm run dev
 ## Keamanan & Penyimpanan Lokal
 
 - **Data & Rahasia Aman di Lokal:** Folder `warehouse/` dan berkas `backend/.env` sudah masuk `.gitignore`.
-- **SQL Read-Only Sandbox:** Query di SQL Explorer & AI Tool divalidasi hanya 1 statement `SELECT`/`WITH` serta menjalankan `SET enable_external_access = false` di DuckDB.
+- **SQL Read-Only Sandbox:** Query di SQL Explorer & AI Tool divalidasi hanya 1 statement `SELECT`/`WITH` serta menjalankan `SET enable_external_access = false` di DuckDB, dengan batas waktu 30 detik dan maksimal 500 baris hasil.
 - **Proteksi SSRF:** Web scraper otomatis memblokir `localhost`, loopback, dan alamat IP jaringan internal/privat.
 - **Gold-Only Vector Governance:** Hanya tabel di layer `gold.*` yang diizinkan masuk ke Vector Store; menghapus tabel Gold otomatis membersihkan vector terkait.
