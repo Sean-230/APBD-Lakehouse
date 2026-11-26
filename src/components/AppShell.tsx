@@ -73,7 +73,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="framed-shell">
-      <div className="hidden md:flex items-center gap-2.5 px-4 col-start-1 row-start-1">
+      <div className="hidden md:flex items-center gap-2.5 px-4 col-start-1 row-start-1 sticky top-0 z-30 bg-[var(--ground)] h-12">
         <svg
           width="22"
           height="22"
@@ -111,7 +111,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </span>
       </div>
 
-      <header className="flex items-center justify-between gap-3 px-3 md:pl-2 md:pr-4 col-start-1 md:col-start-2 row-start-1">
+      <header className="flex items-center justify-between gap-3 px-3 md:pl-2 md:pr-4 col-start-1 md:col-start-2 row-start-1 sticky top-0 z-30 bg-[var(--ground)] h-12">
         <button
           type="button"
           onClick={() => setDrawerOpen((v) => !v)}

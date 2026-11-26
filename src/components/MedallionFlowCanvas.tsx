@@ -253,7 +253,10 @@ export function MedallionFlowCanvas({
         }`}
       >
         <div className="flex items-start justify-between gap-2">
-          <span className="font-mono-code text-[12px] font-medium text-[var(--text)] break-all">
+          <span
+            title={t.name}
+            className="font-mono-code text-[12px] font-medium text-[var(--text)] truncate"
+          >
             {t.name.split(".")[1]}
           </span>
           {isVectorized && (
