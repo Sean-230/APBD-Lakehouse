@@ -1,5 +1,6 @@
 import logging
 import threading
+import zipfile
 import time
 from collections import defaultdict, deque
 from typing import Any
@@ -35,6 +36,7 @@ app = FastAPI(title="SuraLake API — APBD Surabaya Apache Iceberg Lakehouse")
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # keep in step with next.config.ts
 CHAT_PER_MINUTE = 15
+CHAT_PER_MINUTE_ALL = 60  # all clients together; the per-client address can be faked
 log = logging.getLogger("suralake")
 
 
@@ -92,7 +94,7 @@ def ingest_file(file: UploadFile = File(...)):  # plain def: runs in a thread, s
         raise HTTPException(status_code=413, detail="Ukuran berkas melebihi 50 MB.")
     try:
         return ingest_uploaded_file(file.filename or "upload.bin", content)
-    except ValueError as exc:
+    except (ValueError, zipfile.BadZipFile) as exc:
         raise HTTPException(status_code=400, detail=f"Gagal memproses file: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Gagal memproses file: {exc}") from exc
@@ -104,6 +106,8 @@ def ingest_web(req: WebIngestRequest):
         raise HTTPException(status_code=400, detail="URL harus diawali http:// atau https://")
     try:
         return ingest_web_url(req.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Gagal mengambil URL: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Gagal mengambil URL: {exc}") from exc
 
@@ -240,12 +244,14 @@ def _check_chat_rate(request: Request) -> None:
     with _chat_lock:
         for key in [k for k, v in _chat_hits.items() if v and now - v[-1] > 60]:
             del _chat_hits[key]
-        hits = _chat_hits[client]
-        while hits and now - hits[0] > 60:
-            hits.popleft()
-        if len(hits) >= CHAT_PER_MINUTE:
-            raise HTTPException(status_code=429, detail="Terlalu banyak pertanyaan. Coba lagi dalam satu menit.")
-        hits.append(now)
+        for key, limit in ((client, CHAT_PER_MINUTE), ("*all*", CHAT_PER_MINUTE_ALL)):
+            hits = _chat_hits[key]
+            while hits and now - hits[0] > 60:
+                hits.popleft()
+            if len(hits) >= limit:
+                raise HTTPException(status_code=429, detail="Terlalu banyak pertanyaan. Coba lagi dalam satu menit.")
+        _chat_hits[client].append(now)
+        _chat_hits["*all*"].append(now)
 
 
 @app.post("/api/chat")

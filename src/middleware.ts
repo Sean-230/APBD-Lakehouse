@@ -9,6 +9,11 @@ export function middleware(req: NextRequest) {
     return new NextResponse("Permintaan dari situs lain ditolak.", { status: 403 });
   }
 
+  // Next.js cuts bodies above middlewareClientMaxBodySize (next.config.ts) and the upload then hangs.
+  if (Number(req.headers.get("content-length") ?? 0) > 51 * 1024 * 1024) {
+    return NextResponse.json({ detail: "Ukuran berkas melebihi 50 MB." }, { status: 413 });
+  }
+
   const password = process.env.ADMIN_PASSWORD;
   if (!password) {
     return new NextResponse(

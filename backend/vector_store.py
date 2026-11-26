@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -303,6 +304,24 @@ def rebuild_all_vectors() -> dict[str, Any]:
         }
 
 
+KEYWORD_WEIGHT = 0.5
+
+
+def _keyword_scores(query: str, texts: list[str]) -> np.ndarray:
+    """Share of the query's words (rare words count more) that appear in each text, from 0 to 1.
+
+    Pure meaning-search lets 10,000 budget rows drown a single uploaded PDF or image.
+    """
+    lowered = [t.lower() for t in texts]
+    words = {w for w in re.findall(r"\w{3,}", query.lower())}
+    hits = {w: np.fromiter((w in t for t in lowered), dtype=bool, count=len(lowered)) for w in words}
+    weights = {w: np.log((len(lowered) + 1) / (h.sum() + 1)) for w, h in hits.items()}
+    total = sum(weights.values())
+    if not total:
+        return np.zeros(len(lowered), dtype=np.float32)
+    return (sum(weights[w] * hits[w] for w in hits) / total).astype(np.float32)
+
+
 def search_vectors(query: str, top_k: int = 6) -> dict[str, Any]:
     """Cosine similarity search over the local Parquet vector store."""
     q = query.strip()
@@ -321,7 +340,9 @@ def search_vectors(query: str, top_k: int = 6) -> dict[str, Any]:
     # Cosine similarity
     q_norm = np.linalg.norm(q_vec) + 1e-10
     m_norms = np.linalg.norm(mat, axis=1) + 1e-10
-    scores = (mat @ q_vec) / (m_norms * q_norm)
+    scores = (mat @ q_vec) / (m_norms * q_norm) + KEYWORD_WEIGHT * _keyword_scores(
+        q, table.column("text").to_pylist()
+    )
 
     k = min(max(1, top_k), table.num_rows)
     top_idx = np.argsort(scores)[::-1][:k]

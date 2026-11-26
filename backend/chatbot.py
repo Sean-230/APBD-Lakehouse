@@ -129,7 +129,9 @@ def _build_system_prompt() -> str:
         # Bronze is raw input; leaving it out keeps the prompt within the provider's token limit.
         for t in [t for t in tables if t["layer"] != "bronze"]:
             cols = ", ".join(f"{c['name']}:{c['type']}" for c in t["columns"][:18])
-            lines.append(f"- {t['name']} ({t['rows']} baris): {cols}")
+            ns, name = t["name"].split(".", 1)
+            sql_name = f'{ns}."{name}"' if not re.fullmatch(r"[a-z_][a-z0-9_]*", name) else t["name"]
+            lines.append(f"- {sql_name} ({t['rows']} baris): {cols}")
         schema_block = "\n".join(lines)
 
     vstats = get_vector_stats()
@@ -142,11 +144,11 @@ def _build_system_prompt() -> str:
     return f"""Kamu adalah **SuraLake AI**, asisten analis data APBD Kota Surabaya yang terhubung langsung ke Apache Iceberg Data Lakehouse (Bronze → Silver → Gold) melalui DuckDB dan Vector Search lokal.
 
 Aturan wajib:
-1. Jawab dalam Bahasa Indonesia yang jelas, ramah, dan mudah dipahami oleh orang non-teknis (atau ikuti bahasa pengguna jika bertanya dalam bahasa Inggris).
+1. Jawab dalam BAHASA YANG SAMA dengan pesan terakhir pengguna (pertanyaan berbahasa Inggris dijawab dalam bahasa Inggris), jelas, ramah, dan mudah dipahami orang non-teknis.
 2. **JANGAN PERNAH mengarang atau menebak angka.** Untuk hitungan angka, total, ranking, atau filter tabel, WAJIB panggil `run_sql_query` atau `get_lakehouse_overview`.
 3. Untuk pertanyaan tentang isi dokumen PDF, gambar (OCR), hasil scrape web, tautan RKA, atau pencarian topik bebas, panggil `search_vector_knowledge`.
 4. Prioritaskan query pada tabel `gold.*` untuk ringkasan OPD/tematik/anomali, dan `silver.*` untuk rincian pekerjaan atau komponen eBudgeting. Jika query `silver.ebudgeting_rincian`, selalu perhatikan kolom `tahap` (filter `LOWER(tahap) = 'pak'` atau kelompokkan per `tahap` agar tidak double-counting!).
-5. Format angka Rupiah agar mudah dibaca (contoh: **Rp 9,59 Triliun**, **Rp 500,5 Miliar**, atau angka lengkap jika diminta) dan sebutkan persentase dengan rapi.
+5. Hasil tool sudah memberi label Rupiah untuk angka besar, contoh "930250224427 (Rp 930,25 Miliar)". Di jawaban tulis label itu saja (contoh **Rp 930,25 Miliar**), tanpa angka panjangnya kecuali diminta; JANGAN mengonversi Juta/Miliar/Triliun sendiri. 1 Triliun = 1.000 Miliar.
 6. Jika warehouse masih kosong, beri tahu pengguna dengan ramah bahwa belum ada data yang diunggah.
 7. Untuk RSUD dengan serapan SP2D sangat rendah, beri catatan singkat bahwa RSUD berstatus BLUD sehingga sebagian pencairan tidak melewati mekanisme SP2D reguler.
 8. Nilai SP2D/serapan yang kosong (NULL) berarti data pencairan BELUM diunggah, bukan nol.
@@ -167,7 +169,43 @@ Tabel Apache Iceberg yang tersedia saat ini:
 """
 
 
+def fmt_rupiah(n: float) -> str:
+    for size, unit in ((1e12, "Triliun"), (1e9, "Miliar"), (1e6, "Juta")):
+        if abs(n) >= size:
+            return f"Rp {n / size:,.2f} {unit}".replace(",", "#").replace(".", ",").replace("#", ".")
+    return f"Rp {n:,.0f}".replace(",", ".")
+
+
+_ID_NAME_RE = re.compile(r"(^|_)(id|kode|nomor|no|nik|nip|npwp|tahun)(_|$)|id$|snapshot|sha256", re.IGNORECASE)
+
+
+def _label_money(value: Any, name: str = "") -> Any:
+    """Models misread 12-digit numbers as trillions, so big amounts get a ready-made Rupiah label.
+
+    `name` is the key or column; IDs, codes and years are left alone.
+    """
+    if isinstance(value, dict):
+        if "columns" in value and "rows" in value:
+            cols = value["columns"]
+            value = {**value, "rows": [[_label_money(v, c) for v, c in zip(r, cols)] for r in value["rows"]]}
+        return {k: v if k in ("columns", "rows") else _label_money(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_label_money(v, name) for v in value]
+    if isinstance(value, bool) or _ID_NAME_RE.search(name):
+        return value
+    number = value
+    if isinstance(value, str) and re.fullmatch(r"-?\d+(\.\d+)?", value):
+        number = float(value)
+    if isinstance(number, (int, float)) and abs(number) >= 1e6:
+        return f"{value} ({fmt_rupiah(number)})"
+    return value
+
+
 def _execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    return _label_money(_run_tool(name, args))
+
+
+def _run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "get_lakehouse_overview":
         ov = get_overview_data()
         return {

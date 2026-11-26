@@ -233,6 +233,9 @@ def _write_iceberg_table(
                 tbl.overwrite(arrow_table, overwrite_filter=In(key, values))
             elif existing_cols != incoming_cols:
                 tbl = None
+            elif identifier.startswith("gold.") and tbl.scan().to_arrow().to_pylist() == arrow_table.to_pylist():
+                snap = tbl.current_snapshot()
+                return {"table": identifier, "rows": arrow_table.num_rows, "snapshot_id": str(snap.snapshot_id) if snap else None}
             else:
                 try:
                     tbl.overwrite(arrow_table)
@@ -1000,7 +1003,7 @@ def _sql_sandbox(catalog: SqlCatalog):
                 if arrow is not None:
                     alias = f"__tbl_{ns}_{tbl_name}"
                     con.register(alias, arrow)
-                    con.execute(f"CREATE OR REPLACE VIEW {full_name} AS SELECT * FROM {alias}")
+                    con.execute(f'CREATE OR REPLACE VIEW {ns}."{tbl_name}" AS SELECT * FROM "{alias}"')
                     registered.append(full_name)
         con.execute("SET memory_limit = '1GB'")
         con.execute("SET enable_external_access = false")
@@ -1091,7 +1094,11 @@ def _rows_for_edit(tbl: Any, row_idx: int, snapshot_id: str) -> tuple[pa.Schema,
 
 def _after_row_change(catalog: SqlCatalog, ident: str) -> list[dict[str, Any]]:
     _drop_stale_vectors(ident)
-    return _rebuild_gold_layers(catalog) if ident.startswith("silver.") else []
+    if ident in ("silver.monitoring_pekerjaan", "silver.ebudgeting_rincian"):
+        return _rebuild_gold_layers(catalog)
+    if ident.startswith("silver.") and catalog.table_exists(_default_gold_target(ident)):
+        return promote_silver_to_gold(ident)["gold"]
+    return []
 
 
 def get_table_rows(
@@ -1354,6 +1361,10 @@ def rebuild_gold() -> dict[str, Any]:
     return {"status": "rebuilt", "layers_written": res}
 
 
+def _default_gold_target(silver_table: str) -> str:
+    return "gold." + re.sub(r"_clean$", "", silver_table.split(".", 1)[1]) + "_summary"
+
+
 @_locked
 def promote_silver_to_gold(
     source_table: str, target_table: str | None = None
@@ -1423,9 +1434,7 @@ def promote_silver_to_gold(
     finally:
         con.close()
 
-    base = source_table.split(".", 1)[1]
-    base_gold = re.sub(r"_clean$", "", base) + "_summary"
-    target_id = target_table or f"gold.{base_gold}"
+    target_id = target_table or _default_gold_target(source_table)
     if not target_id.startswith("gold."):
         target_id = f"gold.{target_id}"
     gold_written = _write_iceberg_table(catalog, target_id, gold_arrow, mode="overwrite")
@@ -1440,7 +1449,7 @@ def promote_silver_to_gold(
 def save_sql_as_gold(query: str, table_name: str) -> dict[str, Any]:
     """Execute a read-only DuckDB SQL query and save its output as a Gold Iceberg table."""
     q = _validate_readonly_sql(query)
-    if duckdb.extract_statements(q)[0].type.name != "SELECT":
+    if not re.match(r"(?i)(select|with|from)\b", q):
         raise ValueError("Hanya query SELECT / WITH yang bisa disimpan ke Gold.")
 
     raw_name = table_name.strip().lower()

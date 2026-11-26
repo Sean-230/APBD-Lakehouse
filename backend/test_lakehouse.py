@@ -155,6 +155,47 @@ class Tables(Base):
         self.assertEqual(V._read_existing_vectors(), [])
 
 
+class QaRegressions(Base):
+    def test_table_name_starting_with_a_digit_keeps_sql_working(self):
+        L.ingest_uploaded_file("2026 Data Hibah.csv", b"penerima,nilai\nX,1000\nY,2000\n")
+        self.assertEqual(L.run_duckdb_sql("SELECT 1")["rows"], [["1"]])
+        self.assertEqual(L.run_duckdb_sql('SELECT count(*) FROM bronze."2026_data_hibah_raw"')["rows"], [["2"]])
+
+    def test_editing_a_csv_row_updates_its_gold_and_keeps_other_vectors(self):
+        L.ingest_uploaded_file("belanja.csv", b"opd,nilai\nA,10\nB,20\n")
+        L.promote_bronze_to_silver("bronze.belanja_raw")
+        L.promote_silver_to_gold("silver.belanja_clean")
+        L._write_iceberg_table(L.get_catalog(), "gold.other", pa.Table.from_pylist([{"x": 1}]))
+        V._write_vectors([{"chunk_id": "k", "source": "gold.other", "layer": "gold", "text": "t", "embedding": [1.0]}])
+        page = L.get_table_rows("silver", "belanja_clean")
+        index = next(r["_row_idx"] for r in page["rows"] if r["opd"] == "A")
+        L.update_table_row("silver", "belanja_clean", index, {"nilai": 99}, page["snapshotId"])
+        gold = {r["opd"]: r["total_nilai"] for r in rows("gold.belanja_summary")}
+        self.assertEqual(gold["A"], 99)
+        self.assertEqual([r["source"] for r in V._read_existing_vectors()], ["gold.other"])
+
+    def test_rewriting_unchanged_gold_keeps_snapshot(self):
+        data = pa.Table.from_pylist([{"x": 1}])
+        first = L._write_iceberg_table(L.get_catalog(), "gold.same", data)
+        self.assertEqual(L._write_iceberg_table(L.get_catalog(), "gold.same", data)["snapshot_id"], first["snapshot_id"])
+
+    def test_only_select_can_be_saved_as_gold(self):
+        with self.assertRaises(ValueError):
+            L.save_sql_as_gold("DESCRIBE SELECT 1", "x")
+        self.assertEqual(L.save_sql_as_gold("SELECT 1 AS a", "ok")["table"], "gold.ok")
+
+    def test_money_labels(self):
+        self.assertEqual(chatbot.fmt_rupiah(491558472638), "Rp 491,56 Miliar")
+        self.assertEqual(chatbot.fmt_rupiah(9586156578193), "Rp 9,59 Triliun")
+        out = chatbot._label_money({"columns": ["id_x", "alokasi_rp"], "rows": [["12345678", "930250224427"]]})
+        self.assertEqual(out["rows"][0], ["12345678", "930250224427 (Rp 930,25 Miliar)"])
+
+    def test_rare_query_words_outrank_common_ones(self):
+        texts = ["anggaran BOS sekolah"] * 500 + ["Gambar OCR Anggaran Posyandu 2026"]
+        scores = V._keyword_scores("anggaran posyandu", texts)
+        self.assertEqual(int(scores.argmax()), 500)
+
+
 class Vectors(Base):
     def test_every_row_is_indexed(self):
         table = pa.Table.from_pylist([{"nama": f"item {i}"} for i in range(900)])
