@@ -21,6 +21,7 @@ export interface TematikRow {
 
 export interface OverviewResponse {
   isEmpty: boolean;
+  readyForAnalysis: boolean;
   totals: {
     alokasiRp: number;
     realisasiRp: number | null;
@@ -88,11 +89,12 @@ export interface SqlResponse {
 
 export const EMPTY_OVERVIEW: OverviewResponse = {
   isEmpty: true,
+  readyForAnalysis: false,
   totals: {
     alokasiRp: 0,
-    realisasiRp: 0,
-    sp2dRp: 0,
-    serapanPct: 0,
+    realisasiRp: null,
+    sp2dRp: null,
+    serapanPct: null,
     opdCount: 0,
     anomaliCount: 0,
     tableCount: 0,
@@ -244,11 +246,14 @@ export async function updateTableRow(
   snapshotId: string
 ) {
   const [ns, tbl] = splitIdent(fullName);
-  const res = await fetch(`/api/tables/${ns}/${tbl}/rows/${rowIdx}?snapshot_id=${snapshotId}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ data: rowData }),
-  });
+  const res = await fetch(
+    `/api/tables/${ns}/${tbl}/rows/${rowIdx}?snapshot_id=${encodeURIComponent(snapshotId)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: rowData }),
+    }
+  );
   const data = await parseApiJson(res);
   if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
   return data;
@@ -256,9 +261,12 @@ export async function updateTableRow(
 
 export async function deleteTableRow(fullName: string, rowIdx: number, snapshotId: string) {
   const [ns, tbl] = splitIdent(fullName);
-  const res = await fetch(`/api/tables/${ns}/${tbl}/rows/${rowIdx}?snapshot_id=${snapshotId}`, {
-    method: "DELETE",
-  });
+  const res = await fetch(
+    `/api/tables/${ns}/${tbl}/rows/${rowIdx}?snapshot_id=${encodeURIComponent(snapshotId)}`,
+    {
+      method: "DELETE",
+    }
+  );
   const data = await parseApiJson(res);
   if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
   return data;
@@ -336,7 +344,10 @@ export async function sendChatMessage(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message, history }),
   });
-  const data = await parseApiJson(res);
+  // Public page: replace the panel's technical "backend is down" message.
+  const data = await parseApiJson(res).catch(() => {
+    throw new Error("Asisten AI sedang tidak dapat dihubungi. Silakan coba lagi sebentar.");
+  });
   if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
   return data;
 }

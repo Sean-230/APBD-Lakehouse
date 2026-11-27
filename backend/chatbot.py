@@ -10,8 +10,10 @@ from typing import Any
 import httpx
 
 from lakehouse import (
+    get_catalog,
     get_catalog_summary,
     get_overview_data,
+    has_curated_data,
     run_duckdb_sql,
 )
 from vector_store import get_vector_stats, search_vectors
@@ -21,6 +23,8 @@ ENV_PATH = Path(__file__).resolve().parent / ".env"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 # Tried in order; a busy (503) or rate-limited model falls through to the next.
 DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+# Raw (Bronze) data is not cleaned or audited yet, so the public chatbot never loads it.
+CHAT_NAMESPACES = ("silver", "gold")
 
 
 def _read_env_file() -> dict[str, str]:
@@ -51,15 +55,15 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "run_sql_query",
             "description": (
-                "Menjalankan query DuckDB SQL (hanya SELECT/WITH) terhadap tabel Apache Iceberg "
-                "(bronze.*, silver.*, gold.*) untuk mendapatkan angka pasti, total, ranking, filter, atau rincian APBD Surabaya."
+                "Menjalankan query SQL gaya PostgreSQL (hanya SELECT/WITH) terhadap tabel data kurasi "
+                "(silver.*, gold.*) untuk mendapatkan angka pasti, total, ranking, filter, atau rincian APBD Surabaya."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Query SQL DuckDB yang valid (SELECT / WITH). Gunakan LIMIT <= 30 untuk daftar baris.",
+                        "description": "Query SQL yang valid (SELECT / WITH). Gunakan LIMIT <= 30 untuk daftar baris.",
                     },
                     "reason": {
                         "type": "string",
@@ -76,7 +80,7 @@ TOOLS: list[dict[str, Any]] = [
             "name": "get_lakehouse_overview",
             "description": (
                 "Mengambil ringkasan cepat APBD Surabaya saat ini: total alokasi, total SP2D, persentase serapan, "
-                "jumlah OPD, jumlah anomali, anggaran tematik prioritas, dan status layer Bronze/Silver/Gold."
+                "jumlah OPD, jumlah anomali, dan anggaran tematik prioritas."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -86,8 +90,8 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "search_vector_knowledge",
             "description": (
-                "Pencarian semantik (Vector Search) terhadap seluruh dokumen yang telah di-index: PDF, gambar hasil OCR, "
-                "halaman web hasil scrape surabaya.go.id, CSV teks, dan ringkasan Gold. Gunakan tool ini untuk mencari topik, "
+                "Pencarian semantik terhadap seluruh dokumen yang siap dicari: PDF, gambar hasil OCR, "
+                "halaman web hasil scrape surabaya.go.id, CSV teks, dan ringkasan APBD. Gunakan tool ini untuk mencari topik, "
                 "isi dokumen PDF/gambar, tautan web, atau informasi tidak terstruktur."
             ),
             "parameters": {
@@ -113,34 +117,31 @@ def _ebudgeting_coverage(tables: list[dict[str, Any]]) -> str:
     """eBudgeting usually covers only a few OPDs; the model must know which."""
     if not any(t["name"] == "silver.ebudgeting_rincian" for t in tables):
         return "(belum diunggah)"
-    rows = run_duckdb_sql("SELECT DISTINCT nama_opd FROM silver.ebudgeting_rincian ORDER BY 1")["rows"]
-    names = "; ".join(r[0] for r in rows[:15])
-    return f"{len(rows)} OPD: {names}" + ("; dst." if len(rows) > 15 else "")
+    tbl = get_catalog().load_table("silver.ebudgeting_rincian")
+    col = tbl.scan(selected_fields=("nama_opd",)).to_arrow().column("nama_opd")
+    opds = sorted({str(v).strip() for v in col.to_pylist() if v and str(v).strip()})
+    if not opds:
+        return "(kosong)"
+    names = "; ".join(opds[:15])
+    return f"{len(opds)} OPD: {names}" + ("; dst." if len(opds) > 15 else "")
 
 
-def _build_system_prompt() -> str:
-    cat = get_catalog_summary()
-    tables = cat.get("tables", [])
-    if not tables:
-        schema_block = "(Warehouse Apache Iceberg saat ini masih kosong — belum ada tabel yang di-ingest.)"
-    else:
-        lines = []
-        # Bronze is raw input; leaving it out keeps the prompt within the provider's token limit.
-        for t in [t for t in tables if t["layer"] != "bronze"]:
-            cols = ", ".join(f"{c['name']}:{c['type']}" for c in t["columns"][:18])
-            ns, name = t["name"].split(".", 1)
-            sql_name = f'{ns}."{name}"' if not re.fullmatch(r"[a-z_][a-z0-9_]*", name) else t["name"]
-            lines.append(f"- {sql_name} ({t['rows']} baris): {cols}")
-        schema_block = "\n".join(lines)
+def _build_system_prompt(tables: list[dict[str, Any]], vstats: dict[str, Any]) -> str:
+    lines = []
+    for t in [t for t in tables if t["layer"] in CHAT_NAMESPACES]:
+        cols = ", ".join(f"{c['name']}:{c['type']}" for c in t["columns"][:18])
+        ns, name = t["name"].split(".", 1)
+        sql_name = f'{ns}."{name}"' if not re.fullmatch(r"[a-z_][a-z0-9_]*", name) else t["name"]
+        lines.append(f"- {sql_name} ({t['rows']} baris): {cols}")
+    schema_block = "\n".join(lines)
 
-    vstats = get_vector_stats()
     vector_note = (
-        f"Vector Index lokal aktif: {vstats['totalChunks']} chunks dari {len(vstats['sources'])} sumber."
+        f"aktif, {vstats['totalChunks']} potongan teks dari {len(vstats['sources'])} sumber."
         if vstats["totalChunks"] > 0
-        else "Vector Index lokal masih kosong (0 chunks)."
+        else "masih kosong."
     )
 
-    return f"""Kamu adalah **SuraLake AI**, asisten analis data APBD Kota Surabaya yang terhubung langsung ke Apache Iceberg Data Lakehouse (Bronze → Silver → Gold) melalui DuckDB dan Vector Search lokal.
+    prompt = f"""Kamu adalah **SuraLake AI**, asisten analis data APBD Kota Surabaya.
 
 Aturan wajib:
 1. LANGUAGE: always reply in the same language as the user's latest message. An English question gets a fully English answer. Pertanyaan bahasa Indonesia dijawab dalam bahasa Indonesia. Jawaban harus jelas, ramah, dan mudah dipahami orang non-teknis.
@@ -148,25 +149,33 @@ Aturan wajib:
 3. Untuk pertanyaan tentang isi dokumen PDF, gambar (OCR), hasil scrape web, tautan RKA, atau pencarian topik bebas, panggil `search_vector_knowledge`.
 4. Prioritaskan query pada tabel `gold.*` untuk ringkasan OPD/tematik/anomali, dan `silver.*` untuk rincian pekerjaan atau komponen eBudgeting. Untuk angka eBudgeting (komponen, belanja, sub kegiatan) WAJIB pakai `gold.ebudgeting_curated` atau `gold.apbd_subkegiatan_summary`: isinya sudah tahap final (PAK). `silver.ebudgeting_rincian` berisi semua versi (murni, revisi, PAK) dari anggaran yang sama, jadi menjumlahkannya tanpa filter tahap = HITUNG DOBEL. Pakai silver hanya jika pengguna bertanya riwayat per tahap.
 5. Hasil tool sudah memberi label Rupiah untuk angka besar, contoh "930250224427 (Rp 930,25 Miliar)". Di jawaban tulis label itu saja (contoh **Rp 930,25 Miliar**), tanpa angka panjangnya kecuali diminta; JANGAN mengonversi Juta/Miliar/Triliun sendiri. 1 Triliun = 1.000 Miliar.
-6. Jika warehouse masih kosong, beri tahu pengguna dengan ramah bahwa belum ada data yang diunggah.
+6. Jika data yang ditanyakan tidak ada di tabel di bawah maupun di dokumen, katakan terus terang bahwa datanya belum tersedia.
 7. Hanya untuk OPD yang namanya mengandung "RSUD" dan serapan SP2D-nya sangat rendah, beri catatan singkat bahwa RSUD berstatus BLUD sehingga sebagian pencairan tidak melewati mekanisme SP2D reguler.
 8. Nilai SP2D/serapan yang kosong (NULL) berarti data pencairan BELUM diunggah, bukan nol.
 9. Filter nama OPD memakai ILIKE '%kata kunci%' (contoh: "rs eka candrarini" = nama_opd ILIKE '%eka candrarini%').
-10. Pertanyaan belanja barang/pos tertentu (contoh: obat): jika OPD tercakup di silver.ebudgeting_rincian, cari di nama_komponen, nama_detil, nama_rekening (perhatikan tahap). Jika tidak tercakup, cari di silver.monitoring_pekerjaan HANYA pada kolom nama_pekerjaan (nama sub kegiatan menggabungkan beberapa jenis belanja, jadi jangan dipakai untuk total pos), lalu jelaskan bahwa angkanya berdasarkan nama paket pekerjaan. Sebutkan paket terbesar yang dihitung, dan ingat '%obat%' juga cocok dengan kata seperti "pengobatan".
-11. Total WAJIB dihitung database atas SEMUA baris yang cocok, jangan menjumlahkan sendiri baris yang ditampilkan. Untuk daftar sekaligus total, pakai satu query: SELECT nama_pekerjaan, alokasi_rp, SUM(alokasi_rp) OVER () AS total_semua, COUNT(*) OVER () AS jumlah_baris_semua FROM ... WHERE ... ORDER BY alokasi_rp DESC LIMIT 10. Sebutkan jumlah_baris_semua di jawaban.
-12. gold.dq_anomaly_audit HANYA berisi baris bermasalah. Jangan pernah memakainya untuk total anggaran atau belanja.
-13. Pertanyaan lanjutan ("untuk pos belanja obat") memakai OPD dan konteks dari percakapan sebelumnya.
+10. Pertanyaan belanja barang/pos tertentu (contoh: obat): jika OPD tercakup di silver.ebudgeting_rincian, cari di nama_komponen, nama_detil, nama_rekening (perhatikan tahap). Jika tidak tercakup, cari di silver.monitoring_pekerjaan HANYA pada kolom nama_pekerjaan (nama sub kegiatan menggabungkan beberapa jenis belanja, jadi jangan dipakai untuk total pos), lalu jelaskan bahwa angkanya berdasarkan nama paket pekerjaan. Selalu ambil alokasi_rp, penggunaan_dana_rp, dan sp2d_rp bersama totalnya — pada beberapa paket RSUD/BLUD, alokasi_rp bisa berupa placeholder kecil sementara rencana belanja operasionalnya ada di penggunaan_dana_rp. Sebutkan paket terbesar yang dihitung, dan ingat '%obat%' juga cocok dengan kata seperti "pengobatan".
+11. Total WAJIB dihitung database atas SEMUA baris yang cocok, jangan menjumlahkan sendiri baris yang ditampilkan. Untuk daftar sekaligus total, pakai satu query: SELECT nama_pekerjaan, alokasi_rp, penggunaan_dana_rp, sp2d_rp, SUM(alokasi_rp) OVER () AS total_alokasi, SUM(penggunaan_dana_rp) OVER () AS total_penggunaan_dana, SUM(sp2d_rp) OVER () AS total_sp2d, COUNT(*) OVER () AS jumlah_baris_semua FROM ... WHERE ... ORDER BY GREATEST(alokasi_rp, penggunaan_dana_rp) DESC LIMIT 10. Sebutkan jumlah_baris_semua di jawaban.
+12. **Aturan OVERBUDGET & Anomali Data (khusus untuk query internal kamu):**
+    - `gold.dq_anomaly_audit` HANYA berisi baris yang memiliki catatan anomali (`dq_flag <> ''`). Jangan pernah memakainya untuk total anggaran atau belanja OPD.
+    - Di data Monitoring Pemkot, `alokasi_rp` adalah alokasi awal / pagu kontrak paket (pada paket multi-item seperti obat/farmasi RSUD sering berupa angka placeholder Rp 50 Juta), sedangkan `penggunaan_dana_rp` adalah **Rencana Penggunaan Dana** operasional sebenarnya.
+    - **JANGAN pernah menyebut paket overbudget hanya karena `sp2d_rp > alokasi_rp` jika `sp2d_rp <= penggunaan_dana_rp`!** Contoh: Alokasi Rp 50 Juta, Penggunaan Dana Rp 7,02 Miliar, SP2D Rp 6,96 Miliar (99,1% dari Penggunaan Dana) → **BUKAN overbudget**.
+    - Bedakan dua jenis temuan di `gold.dq_anomaly_audit` saat menyusun query:
+      a) `dq_flag = 'OVERBUDGET'`: **Overbudget sungguhan** (`sp2d_rp` melebihi `alokasi_rp` DAN `penggunaan_dana_rp`, yaitu `sp2d_rp > pagu_efektif_rp`).
+      b) `dq_flag = 'SP2D_OVER_PENGGUNAAN_DANA'`: **Pencairan melebihi rencana penggunaan dana**, tetapi masih dalam batas `alokasi_rp` (mis. pencairan sekaligus/lebih cepat dari jadwal penggunaan dana).
+    - Saat menjawab pertanyaan "apakah ada yang overbudget", WAJIB cek `gold.dq_anomaly_audit` berdasarkan `dq_flag`, tampilkan Alokasi Awal, Rencana Penggunaan Dana, dan Realisasi SP2D secara berdampingan, dan pisahkan jelas antara temuan **Overbudget Sungguhan** dan **Pencairan Melebihi Rencana Penggunaan Dana** (tanpa menulis nama tabel, nama kolom, atau kode `dq_flag` ke pengguna).
+13. Pertanyaan lanjutan ("untuk pos belanja obat", "apakah ada yang overbudget") memakai OPD dan konteks dari percakapan sebelumnya.
 14. Jika hasil query kosong, coba kata kunci atau tabel lain sebelum menyimpulkan datanya tidak ada.
-15. Tulis jawaban dengan teks biasa, tebal, daftar, atau tabel markdown. Jangan memakai kutipan (>) dan jangan menulis tag tool_call.
+15. **Gaya Bahasa Publik (WAJIB):** Tulis jawaban dengan teks biasa, tebal, daftar, atau tabel markdown yang ramah pengguna non-teknis. Jangan memakai kutipan (>), jangan menulis tag tool_call, dan **JANGAN PERNAH menyebut nama tabel database (`gold.*`, `silver.*`, `bronze.*`), nama kolom (`alokasi_rp`, `penggunaan_dana_rp`, `sp2d_rp`, `pagu_efektif_rp`, `dq_flag`, dll.), kode flag internal (`OVERBUDGET`, `SP2D_OVER_PENGGUNAAN_DANA`, `FISIK_OVER_100`), ekspresi SQL, atau istilah mesin internal (`Apache Iceberg`, `DuckDB`, `Data Lakehouse`, `Vector Index`, `layer Bronze/Silver/Gold`)** di dalam jawaban akhir — semua nama teknis tersebut hanya untuk query internalmu. Gunakan istilah sehari-hari seperti "data monitoring APBD", "Alokasi Awal", "Rencana Penggunaan Dana", "Realisasi SP2D", dan "Pagu Efektif".
 16. Tautan ditulis sebagai link markdown dengan nama singkat, contoh [RKA Kec. Simokerto](https://...), bukan URL panjang. Saat menampilkan daftar dokumen/tautan, tambahkan penjelasan singkat (satu kalimat) tentang isi dokumen berdasarkan judul atau teks tautannya; jangan mengarang isi yang tidak ada di data.
 
 Cakupan silver.ebudgeting_rincian: {_ebudgeting_coverage(tables)}
 
-Status Vector Index: {vector_note}
+Pencarian dokumen: {vector_note}
 
-Tabel Apache Iceberg yang tersedia saat ini:
+Tabel yang tersedia saat ini (hanya untuk query internalmu):
 {schema_block}
 """
+    return prompt
 
 
 def fmt_rupiah(n: float) -> str:
@@ -201,6 +210,9 @@ def _label_money(value: Any, name: str = "") -> Any:
     return value
 
 
+_SOURCE_TAG_RE = re.compile(r"^\[(?:bronze|silver|gold)\.\w+\]\s*")
+
+
 def _execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     return _label_money(_run_tool(name, args))
 
@@ -208,17 +220,16 @@ def _execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 def _run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "get_lakehouse_overview":
         ov = get_overview_data()
+        if not ov["opd"]:  # zero totals would read as a real "Rp 0"
+            return {"catatan": "Ringkasan APBD belum tersedia. Cari angkanya dengan run_sql_query."}
         return {
-            "isEmpty": ov["isEmpty"],
-            "totals": ov["totals"],
-            "layers": ov["layers"],
+            "totals": {k: v for k, v in ov["totals"].items() if k != "tableCount"},
             "tematik": ov["tematik"],
             "top_5_opd": ov["opd"][:5],
-            "latestSnapshotId": ov["latestSnapshotId"],
         }
     if name == "run_sql_query":
         query = str(args.get("query") or "").strip()
-        res = run_duckdb_sql(query)
+        res = run_duckdb_sql(query, allowed_namespaces=CHAT_NAMESPACES)
         # Keep payload compact for LLM context
         return {
             "columns": res["columns"],
@@ -231,7 +242,8 @@ def _run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "search_vector_knowledge":
         q = str(args.get("query") or "").strip()
         top_k = int(args.get("top_k") or 6)
-        return search_vectors(q, top_k=min(max(1, top_k), 12))
+        hits = search_vectors(q, top_k=min(max(1, top_k), 12))["results"]
+        return {"results": [{"text": _SOURCE_TAG_RE.sub("", h["text"]), "score": h["score"]} for h in hits]}
     return {"error": f"Tool tidak dikenal: {name}"}
 
 
@@ -317,21 +329,67 @@ def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
     ]
 
 
-_EN_WORDS = {"what", "how", "which", "the", "is", "are", "of", "much", "many", "and", "total", "budget", "show", "list", "please", "who", "why", "does", "so", "far"}
+_EN_WORDS = {"there", "any", "can", "you", "what", "how", "which", "the", "is", "are", "of", "much", "many", "and", "total", "budget", "show", "list", "please", "who", "why", "does", "so", "far"}
 _ID_WORDS = {"apa", "berapa", "yang", "dan", "di", "untuk", "dari", "anggaran", "dinas", "tolong", "mana", "saja", "ini", "itu", "ada"}
+
+
+def _is_english(message: str) -> bool:
+    words = re.findall(r"[a-z]+", message.lower())
+    english = sum(w in _EN_WORDS for w in words)
+    return english >= 2 and english > sum(w in _ID_WORDS for w in words)
 
 
 def _with_language_hint(message: str) -> str:
     """Small models ignore the language rule in the system prompt, so English questions get an explicit nudge."""
-    words = re.findall(r"[a-z]+", message.lower())
-    english = sum(w in _EN_WORDS for w in words)
-    if english >= 2 and english > sum(w in _ID_WORDS for w in words):
-        return f"{message}\n\n(Answer in English.)"
-    return message
+    return f"{message}\n\n(Answer in English.)" if _is_english(message) else message
+
+
+def _not_ready_answer(message: str, has_raw_data: bool) -> str:
+    if _is_english(message):
+        reason = "the uploaded data has not finished being processed" if has_raw_data else "no data has been uploaded yet"
+        return f"Sorry, there is no data ready to analyse yet because {reason}. Please try again later."
+    reason = "data yang diunggah belum selesai diproses dan dikurasi" if has_raw_data else "belum ada data yang diunggah"
+    return f"Maaf, belum ada data yang siap dianalisis karena {reason}. Silakan coba lagi nanti."
 
 
 def _clean_answer(content: str) -> str:
     return _TAG_BLOCK_RE.sub("", content).strip()
+
+
+_PUBLIC_TERMS = {
+    "alokasi_rp": "Alokasi Awal",
+    "penggunaan_dana_rp": "Rencana Penggunaan Dana",
+    "sp2d_rp": "Realisasi SP2D",
+    "pagu_efektif_rp": "Pagu Efektif",
+    "selisih_overbudget_rp": "Selisih Overbudget",
+    "total_realisasi_rp": "Total Realisasi",
+    "dq_flag": "catatan data",
+    "OVERBUDGET": "Overbudget",
+    "SP2D_OVER_PENGGUNAAN_DANA": "Pencairan Melebihi Rencana Penggunaan Dana",
+    "FISIK_OVER_100": "Progres Fisik di Atas 100%",
+}
+# Applied in order. The two snake_case rules catch columns, SQL aliases and flags not listed above.
+_PUBLIC_RULES: list[tuple[re.Pattern[str], Any]] = [
+    (re.compile(r"```(?:sql)?\s*(?:SELECT|WITH)\b.*?(?:```|\Z)|`\s*(?:SELECT|WITH)\b[^`\n]*`", re.I | re.S), ""),
+    (re.compile(r'\b(?:bronze|silver|gold)\.(?:"[^"\n]*"|\*|\w+)|\b__tbl_\w+', re.I), "data APBD"),
+    (re.compile(rf"\b(?:{'|'.join(_PUBLIC_TERMS)})\b"), lambda m: _PUBLIC_TERMS[m[0]]),
+    # Not before ".ext": file names keep their underscores.
+    (re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b(?!\.\w)"), lambda m: m[0].removesuffix("_rp").replace("_", " ")),
+    (re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b(?!\.\w)"), lambda m: m[0].replace("_", " ").title()),
+    (re.compile(r"\b(?:Apache\s+)?Iceberg\b|\bDuckDB\b|\b(?:Data\s+)?Lakehouse\b", re.I), "sistem data"),
+    (re.compile(r"\bVector\s+(?:Index|Search|Store)\b", re.I), "pencarian dokumen"),
+    (re.compile(r"\b(?:layer|lapisan|tabel|table)\s+(?:Bronze|Silver|Gold)\b", re.I), "data"),
+]
+_LINK_RE = re.compile(r"(\]\([^)\s]*\)|https?://[^\s)\]]+)")
+
+
+def _hide_internals(answer: str) -> str:
+    """Rule 15 asks the model not to name internals; this enforces it. Links are left untouched."""
+    parts = _LINK_RE.split(answer)
+    for i in range(0, len(parts), 2):
+        for pattern, replacement in _PUBLIC_RULES:
+            parts[i] = pattern.sub(replacement, parts[i])
+    return "".join(parts).strip()
 
 
 def chat_with_lakehouse(
@@ -345,7 +403,19 @@ def chat_with_lakehouse(
     if not user_msg:
         raise ValueError("Pesan tidak boleh kosong.")
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": _build_system_prompt()}]
+    cat = get_catalog_summary()
+    vstats = get_vector_stats()
+    if not has_curated_data(cat["tables"]) and vstats["totalChunks"] == 0:
+        # Answered here: nothing to analyse, so no model call is spent.
+        return {
+            "answer": _not_ready_answer(user_msg, has_raw_data=any(t["rows"] > 0 for t in cat["tables"])),
+            "model": "",
+            "sqlUsed": [],
+            "snapshotId": None,
+        }
+    latest_snapshot_id = cat["snapshots"][0]["id"] if cat["snapshots"] else None
+    system_prompt = _build_system_prompt(cat["tables"], vstats)
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     for item in (history or [])[-8:]:
         role = item.get("role")
         content = _clean_answer(str(item.get("content") or ""))
@@ -371,7 +441,7 @@ def chat_with_lakehouse(
         tool_calls = assistant_msg.get("tool_calls") or _parse_text_tool_calls(content)
 
         if final_round or not tool_calls:
-            answer = _clean_answer(content)
+            answer = _hide_internals(_clean_answer(content))
             break
 
         # Append assistant tool call request
@@ -413,5 +483,5 @@ def chat_with_lakehouse(
         "answer": answer or "Maaf, saya belum bisa menyusun jawaban. Coba persempit pertanyaan kamu.",
         "model": used_model,
         "sqlUsed": sql_used,
-        "snapshotId": get_overview_data().get("latestSnapshotId"),
+        "snapshotId": latest_snapshot_id,
     }

@@ -192,7 +192,14 @@ export default function CatalogPage() {
         text: `Baris #${rowIdx} dihapus dari ${selected.name} · Snapshot baru: ${res.snapshot_id}`,
       });
       await refreshAll();
-      await loadRows(selected.name, offset, rowSearch);
+      const nextOffset =
+        offset > 0 && typeof res.remainingRows === "number" && res.remainingRows <= offset
+          ? Math.max(0, offset - PAGE_SIZE)
+          : offset;
+      if (nextOffset !== offset) {
+        setOffset(nextOffset);
+      }
+      await loadRows(selected.name, nextOffset, rowSearch);
     } catch (err) {
       setNotice({
         type: "err",
@@ -589,9 +596,20 @@ export default function CatalogPage() {
               {loadingRows ? (
                 <p className="text-[13px] text-[var(--faint)] py-4">Memuat baris dari Apache Iceberg...</p>
               ) : !tableData || tableData.rows.length === 0 ? (
-                <p className="text-[13px] text-[var(--faint)] py-4">
-                  Tidak ada baris yang cocok.
-                </p>
+                <div className="flex items-center justify-between gap-3 py-4">
+                  <p className="text-[13px] text-[var(--faint)]">
+                    Tidak ada baris yang cocok.
+                  </p>
+                  {offset > 0 && tableData && tableData.filteredRows > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+                      className="h-7 px-2.5 rounded border border-[var(--control)] bg-white text-[12px] text-[var(--text)] cursor-pointer"
+                    >
+                      Kembali ke halaman sebelumnya
+                    </button>
+                  )}
+                </div>
               ) : (
                 <>
                   <div className="overflow-x-auto">

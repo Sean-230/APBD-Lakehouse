@@ -134,10 +134,10 @@ export default function OverviewPage() {
     const q = searchQuery.trim().toLowerCase();
     return overview.opd.filter((o) => {
       const qOk = !q || o.nama_opd.toLowerCase().includes(q);
-      const hOk = healthFilter === "all" || classifyHealth(o) === healthFilter;
+      const hOk = !hasSp2d || healthFilter === "all" || classifyHealth(o) === healthFilter;
       return qOk && hOk;
     });
-  }, [overview.opd, searchQuery, healthFilter]);
+  }, [overview.opd, searchQuery, healthFilter, hasSp2d]);
 
   const visibleOpd = showAll ? filteredOpd : filteredOpd.slice(0, 12);
 
@@ -624,21 +624,34 @@ export default function OverviewPage() {
                         </span>
                       </div>
 
-                      <div className="flex items-baseline justify-between gap-2">
-                        <span className="text-[20px] font-semibold tabular-nums text-[var(--text)]">
-                          {fmtPct(o.serapan_sp2d_pct)}
-                        </span>
-                        <span className="text-[12px] text-[var(--muted)] tabular-nums">
-                          {fmtRp(o.sp2d_rp)} / {fmtRp(o.alokasi_rp)}
-                        </span>
-                      </div>
+                      {hasSp2d ? (
+                        <>
+                          <div className="flex items-baseline justify-between gap-2">
+                            <span className="text-[20px] font-semibold tabular-nums text-[var(--text)]">
+                              {fmtPct(o.serapan_sp2d_pct)}
+                            </span>
+                            <span className="text-[12px] text-[var(--muted)] tabular-nums">
+                              {fmtRp(o.sp2d_rp)} / {fmtRp(o.alokasi_rp)}
+                            </span>
+                          </div>
 
-                      <div className="w-full h-2 bg-[var(--rule)] rounded-full overflow-hidden">
-                        <div
-                          className={`h-full ${isLow ? "bg-[var(--negative)]" : "bg-[var(--accent)]"}`}
-                          style={{ width: `${Math.min(100, o.serapan_sp2d_pct ?? 0)}%` }}
-                        />
-                      </div>
+                          <div className="w-full h-2 bg-[var(--rule)] rounded-full overflow-hidden">
+                            <div
+                              className={`h-full ${isLow ? "bg-[var(--negative)]" : "bg-[var(--accent)]"}`}
+                              style={{ width: `${Math.min(100, o.serapan_sp2d_pct ?? 0)}%` }}
+                            />
+                          </div>
+                        </>
+                      ) : (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[18px] font-semibold tabular-nums text-[var(--text)]">
+                            {fmtRp(o.alokasi_rp)}
+                          </span>
+                          <span className="text-[12px] text-[var(--faint)]">
+                            Total anggaran (SP2D belum tersedia)
+                          </span>
+                        </div>
+                      )}
 
                       <div className="flex items-center justify-between text-[12px] text-[var(--faint)] tabular-nums pt-1">
                         <span>{o.jumlah_sub_kegiatan} sub-kegiatan</span>

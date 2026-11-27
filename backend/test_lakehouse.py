@@ -195,6 +195,205 @@ class QaRegressions(Base):
         scores = V._keyword_scores("anggaran posyandu", texts)
         self.assertEqual(int(scores.argmax()), 500)
 
+    def test_monitoring_dq_flags_distinguish_overbudget_and_penggunaan_dana(self):
+        raw = [
+            # Normal BLUD package: placeholder alokasi 50jt, real plan 7.02M, SP2D 6.96M (99.1%) -> CLEAN
+            {
+                "perangkat_daerah": "RSUD Eka Candrarini",
+                "id_sub_kegiatan_raw": "1 02 02 2 02 0001 (10)",
+                "nama_sub_kegiatan_raw": "Pelayanan Kesehatan (PPKm: dr. A)",
+                "id_pakerjaan": "1",
+                "nama_pakerjaan": "Belanja Obat 1 RSUD Eka Candrarini",
+                "metode_pekerjaan": "e-Purchasing",
+                "alokasi_rp": 50_000_000,
+                "penggunaan_dana_rp": 7_021_307_828,
+                "rencana_fisik_pct": "14,042.62",
+                "realisasi_fisik_pct": "99.06 (99.06)",
+                "total_realisasi_rp": 6_955_290_699,
+                "sp2d_rp": 6_955_290_699,
+                "rekanan": "",
+                "nilai_kontrak_rp": 0,
+                "_periode_raw": "2026",
+            },
+            # True overbudget: SP2D exceeds BOTH alokasi (50jt) and penggunaan_dana (722.44jt)
+            {
+                "perangkat_daerah": "RSUD Eka Candrarini",
+                "id_sub_kegiatan_raw": "1 02 02 2 02 0001 (10)",
+                "nama_sub_kegiatan_raw": "Pelayanan Kesehatan (PPKm: dr. A)",
+                "id_pakerjaan": "2",
+                "nama_pakerjaan": "Belanja Bahan Kimia Kefarmasian 1",
+                "metode_pekerjaan": "e-Purchasing",
+                "alokasi_rp": 50_000_000,
+                "penggunaan_dana_rp": 722_440_658,
+                "rencana_fisik_pct": "1,444.88",
+                "realisasi_fisik_pct": "100.00",
+                "total_realisasi_rp": 862_127_502,
+                "sp2d_rp": 862_127_502,
+                "rekanan": "",
+                "nilai_kontrak_rp": 0,
+                "_periode_raw": "2026",
+            },
+            # SP2D above penggunaan_dana but still within alokasi -> SP2D_OVER_PENGGUNAAN_DANA
+            {
+                "perangkat_daerah": "RSUD Eka Candrarini",
+                "id_sub_kegiatan_raw": "1 02 02 2 02 0001 (10)",
+                "nama_sub_kegiatan_raw": "Pelayanan Kesehatan (PPKm: dr. A)",
+                "id_pakerjaan": "3",
+                "nama_pakerjaan": "Pengadaan CT Scan 128 Slice",
+                "metode_pekerjaan": "e-Purchasing",
+                "alokasi_rp": 14_400_000_000,
+                "penggunaan_dana_rp": 1_050_000_000,
+                "rencana_fisik_pct": "7.29",
+                "realisasi_fisik_pct": "100.00",
+                "total_realisasi_rp": 14_400_000_000,
+                "sp2d_rp": 14_400_000_000,
+                "rekanan": "",
+                "nilai_kontrak_rp": 14_400_000_000,
+                "_periode_raw": "2026",
+            },
+            # True physical progress > 100%
+            {
+                "perangkat_daerah": "Dinas Kesehatan",
+                "id_sub_kegiatan_raw": "1 02 02 2 01 0001 (11)",
+                "nama_sub_kegiatan_raw": "Layanan Dasar",
+                "id_pakerjaan": "4",
+                "nama_pakerjaan": "Paket Fisik Lebih",
+                "metode_pekerjaan": "Tender",
+                "alokasi_rp": 100_000_000,
+                "penggunaan_dana_rp": 100_000_000,
+                "rencana_fisik_pct": "100.00",
+                "realisasi_fisik_pct": "105.50",
+                "total_realisasi_rp": 90_000_000,
+                "sp2d_rp": 90_000_000,
+                "rekanan": "",
+                "nilai_kontrak_rp": 0,
+                "_periode_raw": "2026",
+            },
+        ]
+        L._write_iceberg_table(L.get_catalog(), "bronze.monitoring_pd_raw", pa.Table.from_pylist(raw))
+        L.promote_bronze_to_silver("bronze.monitoring_pd_raw")
+        L.rebuild_gold()
+
+        silver_by_id = {r["id_pekerjaan"]: r for r in rows("silver.monitoring_pekerjaan")}
+        self.assertEqual(silver_by_id["1"]["dq_flag"], "")
+        self.assertEqual(silver_by_id["2"]["dq_flag"], "OVERBUDGET")
+        self.assertEqual(silver_by_id["3"]["dq_flag"], "SP2D_OVER_PENGGUNAAN_DANA")
+        self.assertEqual(silver_by_id["4"]["dq_flag"], "FISIK_OVER_100")
+
+        audit = rows("gold.dq_anomaly_audit")
+        self.assertEqual([r["id_pekerjaan"] for r in audit], ["2", "3", "4"])
+        self.assertEqual(audit[0]["pagu_efektif_rp"], 722_440_658)
+        self.assertEqual(audit[0]["selisih_overbudget_rp"], 862_127_502 - 722_440_658)
+
+    def test_subkegiatan_summary_preserves_all_opds_when_both_sources_exist(self):
+        mon = [
+            {
+                "nama_opd": "Dinas Pendidikan",
+                "kode_sub_kegiatan": "1.01.02.2.01.0001",
+                "nama_sub_kegiatan": "Pengelolaan SD",
+                "id_pekerjaan": "1",
+                "nama_pekerjaan": "BOS SD",
+                "alokasi_rp": 1_000_000,
+                "penggunaan_dana_rp": 900_000,
+                "rencana_fisik_pct": 90.0,
+                "realisasi_fisik_pct": 80.0,
+                "total_realisasi_rp": 800_000,
+                "sp2d_rp": 800_000,
+                "dq_flag": "",
+            },
+            {
+                "nama_opd": "Dinas Kesehatan",
+                "kode_sub_kegiatan": "1.02.02.2.01.0001",
+                "nama_sub_kegiatan": "Layanan Puskesmas",
+                "id_pekerjaan": "2",
+                "nama_pekerjaan": "Operasional Puskesmas",
+                "alokasi_rp": 2_000_000,
+                "penggunaan_dana_rp": 1_500_000,
+                "rencana_fisik_pct": 75.0,
+                "realisasi_fisik_pct": 60.0,
+                "total_realisasi_rp": 1_200_000,
+                "sp2d_rp": 1_200_000,
+                "dq_flag": "",
+            },
+        ]
+        eb = [
+            {
+                "nama_opd": "Dinas Pendidikan",
+                "kode_detail_kegiatan": "d1",
+                "kode_sub_kegiatan": "1.01.02.2.01.0001",
+                "nama_sub_kegiatan": "Pengelolaan SD",
+                "nama_subtitle": "BOS",
+                "nama_komponen": "Buku",
+                "nama_detil": "",
+                "satuan": "paket",
+                "volume": 1.0,
+                "koefisien": "1",
+                "harga_satuan_rp": 1_000_000,
+                "pajak_pct": 0.0,
+                "hasil_rp": 1_000_000,
+                "anggaran_rasionalisasi_rp": 1_000_000,
+                "sumber_dana": "DAK Non Fisik",
+                "rekening": "5.1",
+                "nama_rekening": "Belanja Barang",
+                "tahap": "PAK",
+                "is_pendidikan": True,
+                "is_kesehatan": False,
+                "is_infrastruktur": False,
+                "is_stunting": False,
+                "is_miskin": False,
+                "is_inflasi": False,
+            }
+        ]
+        L._write_iceberg_table(L.get_catalog(), "silver.monitoring_pekerjaan", pa.Table.from_pylist(mon))
+        L._write_iceberg_table(L.get_catalog(), "silver.ebudgeting_rincian", pa.Table.from_pylist(eb))
+        L.rebuild_gold()
+
+        sub = {r["nama_opd"]: r for r in rows("gold.apbd_subkegiatan_summary")}
+        self.assertEqual(set(sub.keys()), {"Dinas Pendidikan", "Dinas Kesehatan"})
+        self.assertEqual(sub["Dinas Kesehatan"]["total_anggaran_rp"], 2_000_000)
+        self.assertEqual(sub["Dinas Kesehatan"]["total_sp2d_rp"], 1_200_000)
+        self.assertEqual(sub["Dinas Pendidikan"]["sumber_dana"], "DAK Non Fisik")
+        self.assertEqual(sub["Dinas Pendidikan"]["jumlah_komponen"], 1)
+
+    def test_web_scraper_resolves_relative_links(self):
+        html = '<html><head><title>Dokumen</title></head><body><a href="/files/rka-dinkes.pdf">RKA Dinkes</a></body></html>'
+        real = httpx.Client
+
+        def handler(request):
+            return httpx.Response(200, text=html, headers={"content-type": "text/html"})
+
+        with mock.patch.object(
+            L.httpx, "Client", lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+        ):
+            L.ingest_web_url("http://93.184.216.34/portal/index.html")
+        saved = rows("bronze.web_harvest_raw")
+        self.assertEqual(saved[0]["link_href"], "http://93.184.216.34/files/rka-dinkes.pdf")
+
+    def test_promote_empty_monitoring_raises_clean_error(self):
+        L._write_iceberg_table(
+            L.get_catalog(),
+            "bronze.monitoring_pd_raw",
+            pa.Table.from_pylist([{"perangkat_daerah": ""}]),
+        )
+        with self.assertRaises(ValueError):
+            L.promote_bronze_to_silver("bronze.monitoring_pd_raw")
+
+    def test_vector_score_bounded_and_excludes_dq_audit(self):
+        L._write_iceberg_table(L.get_catalog(), "gold.apbd_opd_summary", pa.Table.from_pylist([{"nama_opd": "Dinas Kesehatan", "alokasi_rp": 100}]))
+        L._write_iceberg_table(L.get_catalog(), "gold.dq_anomaly_audit", pa.Table.from_pylist([{"nama_opd": "Dinas Kesehatan", "dq_flag": "OVERBUDGET"}]))
+
+        class FakeEmbedder:
+            def embed(self, texts, batch_size=32):
+                return [[1.0, 0.0, 0.0] for _ in texts]
+
+        with mock.patch.object(V, "_get_embedder", lambda: FakeEmbedder()):
+            rebuilt = V.rebuild_all_vectors()
+            self.assertEqual(rebuilt["tablesIndexed"], ["gold.apbd_opd_summary"])
+            res = V.search_vectors("Dinas Kesehatan", top_k=5)
+            self.assertEqual(len(res["results"]), 1)
+            self.assertLessEqual(res["results"][0]["score"], 1.0)
+            self.assertGreaterEqual(res["results"][0]["score"], 0.0)
+
 
 class ModelFallback(unittest.TestCase):
     def test_busy_model_is_skipped_on_the_next_call(self):
@@ -228,11 +427,101 @@ class Vectors(Base):
         self.assertEqual(len(V._build_chunks_for_table("gold.big", table)), 900)
 
 
+class ChatbotBoundary(Base):
+    def setUp(self):
+        super().setUp()
+        self.bronze = pa.Table.from_pylist([{"nama_opd": "Dinas Kesehatan", "alokasi_rp": 987654321}])
+        L._write_iceberg_table(L.get_catalog(), "bronze.monitoring_pd_raw", self.bronze)
+
+    def test_chat_sql_cannot_reach_bronze(self):
+        L._write_iceberg_table(L.get_catalog(), "silver.ok", pa.Table.from_pylist([{"x": 1}]))
+        allowed = ("silver", "gold")
+        with self.assertRaisesRegex(Exception, "does not exist"):
+            L.run_duckdb_sql("SELECT * FROM bronze.monitoring_pd_raw", allowed_namespaces=allowed)
+        listed = L.run_duckdb_sql(
+            "SELECT * FROM information_schema.tables WHERE table_schema = 'bronze'", allowed_namespaces=allowed
+        )
+        self.assertEqual(listed["rowCount"], 0)
+        self.assertEqual(L.run_duckdb_sql("SELECT x FROM silver.ok", allowed_namespaces=allowed)["rows"], [["1"]])
+        with self.assertRaisesRegex(Exception, "does not exist"):
+            chatbot._execute_tool("run_sql_query", {"query": "SELECT * FROM bronze.monitoring_pd_raw"})
+
+    def test_admin_sql_still_reads_bronze(self):
+        res = L.run_duckdb_sql("SELECT alokasi_rp FROM bronze.monitoring_pd_raw")
+        self.assertEqual(res["rows"], [["987654321"]])
+        self.assertEqual(L.save_sql_as_gold("SELECT * FROM bronze.monitoring_pd_raw", "dari_bronze")["table"], "gold.dari_bronze")
+
+    def test_metadata_queries_show_no_internal_names(self):
+        for query in (
+            "SHOW TABLES",
+            "SHOW ALL TABLES",
+            "SELECT * FROM information_schema.tables",
+            "SELECT table_name FROM duckdb_tables() UNION ALL SELECT view_name FROM duckdb_views()",
+        ):
+            self.assertNotIn("__tbl", str(L.run_duckdb_sql(query)["rows"]), query)
+        self.assertEqual(L.run_duckdb_sql("SHOW TABLES")["rows"], [])
+
+    def test_raw_only_or_empty_warehouse_answers_without_the_model(self):
+        self.assertFalse(L.get_overview_data()["readyForAnalysis"])
+
+        def no_model(*a, **k):
+            raise AssertionError("the model must not be called")
+
+        def ask(question):
+            with mock.patch.object(chatbot, "_call_llm", no_model), mock.patch.object(
+                chatbot, "_get_llm_config", lambda: ("key", ["m"])
+            ):
+                return chatbot.chat_with_lakehouse(question)
+
+        res = ask("Berapa anggaran Dinas Kesehatan?")
+        self.assertIn("belum selesai diproses", res["answer"])
+        self.assertEqual(res["sqlUsed"], [])
+        self.assertNotRegex(res["answer"], r"(?i)\d|bronze|silver|gold|iceberg|duckdb|lakehouse|monitoring|_rp")
+        self.assertIn("no data ready", ask("What is the total budget of Dinas Kesehatan?")["answer"])
+        L.reset_warehouse()
+        self.assertIn("belum ada data yang diunggah", ask("Berapa anggaran Dinas Kesehatan?")["answer"])
+
+    def test_curated_data_makes_the_chat_ready(self):
+        L._write_iceberg_table(L.get_catalog(), "silver.ok", pa.Table.from_pylist([{"x": 1}]))
+        self.assertTrue(L.get_overview_data()["readyForAnalysis"])
+        self.assertNotIn("totals", chatbot._execute_tool("get_lakehouse_overview", {}))
+        prompt = chatbot._build_system_prompt(L.get_catalog_summary()["tables"], V.get_vector_stats())
+        self.assertIn("silver.ok", prompt)
+        self.assertNotIn("bronze.monitoring_pd_raw", prompt)
+
+    def test_search_results_carry_no_table_names(self):
+        hit = {"chunkId": "k", "source": "gold.x", "layer": "gold", "score": 0.5, "text": "[gold.x] nama: A"}
+        with mock.patch.object(chatbot, "search_vectors", lambda *a, **k: {"results": [hit]}):
+            out = chatbot._execute_tool("search_vector_knowledge", {"query": "a"})
+        self.assertEqual(out, {"results": [{"text": "nama: A", "score": 0.5}]})
+
+    def test_internal_names_are_removed_from_answers(self):
+        leaky = (
+            "Dari `gold.dq_anomaly_audit` dan __tbl_bronze_monitoring_pd_raw: sp2d_rp > pagu_efektif_rp, "
+            "dq_flag = 'OVERBUDGET', SP2D_OVER_PENGGUNAAN_DANA, SP2D_OVER_ALOKASI, total_alokasi, "
+            'silver."2026_x". Apache Iceberg, DuckDB, Data Lakehouse, Vector Index, layer Bronze.\n'
+            "```sql\nSELECT * FROM gold.apbd_opd_summary\n```"
+        )
+        self.assertNotRegex(
+            chatbot._hide_internals(leaky),
+            r"(?i)gold|silver|bronze|__tbl|\w_\w|iceberg|duckdb|lakehouse|vector|select",
+        )
+        fine = (
+            "**Rp 7,02 Miliar** (Overbudget) harga emas gold. [RKA_Dinkes.pdf](https://x.id/a_b/gold.pdf) "
+            "https://x.id/rka_2026 SuraLake"
+        )
+        self.assertEqual(chatbot._hide_internals(fine), fine)
+
+
 class Chat(Base):
     TEXT_CALL = (
         "<tool_call>\n<function=run_sql_query>\n<parameter=query>\nSELECT 42 AS n\n</parameter>\n"
         "<parameter=reason>\ntes\n</parameter>\n</function>\n</tool_call>"
     )
+
+    def setUp(self):
+        super().setUp()  # without curated data the chat answers before calling the model
+        L._write_iceberg_table(L.get_catalog(), "silver.t", pa.Table.from_pylist([{"x": 1}]))
 
     def ask(self, replies):
         queue = iter(replies)

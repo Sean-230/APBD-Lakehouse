@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import duckdb
 import httpx
@@ -322,25 +322,37 @@ def _rebuild_gold_layers(catalog: SqlCatalog) -> list[dict[str, Any]]:
             ).to_arrow_table()
             results.append(_write_iceberg_table(catalog, "gold.apbd_opd_summary", opd_summary, mode="overwrite"))
 
+            real_fisik_expr = (
+                "realisasi_fisik_pct"
+                if "realisasi_fisik_pct" in mon_arrow.schema.names
+                else "NULL::DOUBLE AS realisasi_fisik_pct"
+            )
             anomalies = con.sql(
-                """
+                f"""
                 SELECT
                     nama_opd,
                     kode_sub_kegiatan,
                     id_pekerjaan,
                     nama_pekerjaan,
                     alokasi_rp,
+                    penggunaan_dana_rp,
                     sp2d_rp,
+                    GREATEST(alokasi_rp, penggunaan_dana_rp)::BIGINT AS pagu_efektif_rp,
+                    (sp2d_rp - GREATEST(alokasi_rp, penggunaan_dana_rp))::BIGINT AS selisih_overbudget_rp,
                     rencana_fisik_pct,
+                    {real_fisik_expr},
                     dq_flag
                 FROM silver_mon
                 WHERE dq_flag <> ''
-                ORDER BY rencana_fisik_pct DESC NULLS LAST
+                ORDER BY
+                    CASE WHEN dq_flag LIKE '%OVERBUDGET%' THEN 0 ELSE 1 END,
+                    (sp2d_rp - GREATEST(alokasi_rp, penggunaan_dana_rp)) DESC,
+                    sp2d_rp DESC
                 """
             ).to_arrow_table()
             results.append(_write_iceberg_table(catalog, "gold.dq_anomaly_audit", anomalies, mode="overwrite"))
 
-            # Also expose curated sub-kegiatan summary from Monitoring when eBudgeting is not loaded
+            # Expose curated sub-kegiatan summary from Monitoring when eBudgeting is not loaded
             if eb_arrow is None:
                 mon_sub = con.sql(
                     """
@@ -350,6 +362,7 @@ def _rebuild_gold_layers(catalog: SqlCatalog) -> list[dict[str, Any]]:
                         nama_sub_kegiatan,
                         COUNT(*)::BIGINT AS jumlah_pekerjaan,
                         COALESCE(SUM(alokasi_rp), 0)::BIGINT AS total_anggaran_rp,
+                        COALESCE(SUM(penggunaan_dana_rp), 0)::BIGINT AS total_penggunaan_dana_rp,
                         COALESCE(SUM(sp2d_rp), 0)::BIGINT AS total_sp2d_rp
                     FROM silver_mon
                     WHERE nama_opd IS NOT NULL AND nama_opd <> ''
@@ -428,23 +441,76 @@ def _rebuild_gold_layers(catalog: SqlCatalog) -> list[dict[str, Any]]:
             ).to_arrow_table()
             results.append(_write_iceberg_table(catalog, "gold.ebudgeting_curated", eb_curated, mode="overwrite"))
 
-            # 2. Sub-kegiatan summary mart (41 sub-kegiatan for Dispendik) — great for drill-down & Vector AI
-            eb_sub = con.sql(
-                """
-                SELECT
-                    nama_opd,
-                    kode_sub_kegiatan,
-                    nama_sub_kegiatan,
-                    COUNT(*)::BIGINT AS jumlah_komponen,
-                    COALESCE(SUM(hasil_rp), 0)::BIGINT AS total_anggaran_rp,
-                    STRING_AGG(DISTINCT NULLIF(sumber_dana, ''), ', ') AS sumber_dana,
-                    STRING_AGG(DISTINCT NULLIF(nama_subtitle, ''), '; ') AS daftar_subtitle
-                FROM eb_scoped
-                GROUP BY nama_opd, kode_sub_kegiatan, nama_sub_kegiatan
-                ORDER BY total_anggaran_rp DESC
-                """
-            ).to_arrow_table()
-            results.append(_write_iceberg_table(catalog, "gold.apbd_subkegiatan_summary", eb_sub, mode="overwrite"))
+            # 2. Sub-kegiatan summary mart: preserve ALL OPDs from Monitoring and enrich with eBudgeting PAK details
+            if mon_arrow is not None:
+                unified_sub = con.sql(
+                    """
+                    WITH mon_sub AS (
+                        SELECT
+                            LOWER(TRIM(nama_opd)) AS opd_key,
+                            TRIM(kode_sub_kegiatan) AS kode_key,
+                            ANY_VALUE(nama_opd) AS nama_opd,
+                            ANY_VALUE(kode_sub_kegiatan) AS kode_sub_kegiatan,
+                            ANY_VALUE(nama_sub_kegiatan) AS nama_sub_kegiatan,
+                            COUNT(*)::BIGINT AS jumlah_pekerjaan,
+                            COALESCE(SUM(alokasi_rp), 0)::BIGINT AS total_anggaran_rp,
+                            COALESCE(SUM(penggunaan_dana_rp), 0)::BIGINT AS total_penggunaan_dana_rp,
+                            COALESCE(SUM(sp2d_rp), 0)::BIGINT AS total_sp2d_rp
+                        FROM silver_mon
+                        WHERE nama_opd IS NOT NULL AND nama_opd <> ''
+                        GROUP BY LOWER(TRIM(nama_opd)), TRIM(kode_sub_kegiatan)
+                    ),
+                    eb_sub AS (
+                        SELECT
+                            LOWER(TRIM(nama_opd)) AS opd_key,
+                            TRIM(kode_sub_kegiatan) AS kode_key,
+                            ANY_VALUE(nama_opd) AS nama_opd,
+                            ANY_VALUE(kode_sub_kegiatan) AS kode_sub_kegiatan,
+                            ANY_VALUE(nama_sub_kegiatan) AS nama_sub_kegiatan,
+                            COUNT(*)::BIGINT AS jumlah_komponen,
+                            COALESCE(SUM(hasil_rp), 0)::BIGINT AS total_ebudgeting_rp,
+                            STRING_AGG(DISTINCT NULLIF(sumber_dana, ''), ', ') AS sumber_dana,
+                            STRING_AGG(DISTINCT NULLIF(nama_subtitle, ''), '; ') AS daftar_subtitle
+                        FROM eb_scoped
+                        WHERE nama_opd IS NOT NULL AND nama_opd <> ''
+                        GROUP BY LOWER(TRIM(nama_opd)), TRIM(kode_sub_kegiatan)
+                    )
+                    SELECT
+                        COALESCE(m.nama_opd, e.nama_opd) AS nama_opd,
+                        COALESCE(m.kode_sub_kegiatan, e.kode_sub_kegiatan) AS kode_sub_kegiatan,
+                        COALESCE(NULLIF(m.nama_sub_kegiatan, ''), e.nama_sub_kegiatan) AS nama_sub_kegiatan,
+                        COALESCE(m.jumlah_pekerjaan, 0)::BIGINT AS jumlah_pekerjaan,
+                        COALESCE(e.jumlah_komponen, 0)::BIGINT AS jumlah_komponen,
+                        COALESCE(m.total_anggaran_rp, e.total_ebudgeting_rp, 0)::BIGINT AS total_anggaran_rp,
+                        m.total_penggunaan_dana_rp,
+                        m.total_sp2d_rp,
+                        e.total_ebudgeting_rp,
+                        COALESCE(e.sumber_dana, '') AS sumber_dana,
+                        COALESCE(e.daftar_subtitle, '') AS daftar_subtitle
+                    FROM mon_sub m
+                    FULL OUTER JOIN eb_sub e
+                        ON m.opd_key = e.opd_key AND m.kode_key = e.kode_key
+                    ORDER BY total_anggaran_rp DESC
+                    """
+                ).to_arrow_table()
+                results.append(_write_iceberg_table(catalog, "gold.apbd_subkegiatan_summary", unified_sub, mode="overwrite"))
+            else:
+                eb_sub = con.sql(
+                    """
+                    SELECT
+                        nama_opd,
+                        kode_sub_kegiatan,
+                        nama_sub_kegiatan,
+                        COUNT(*)::BIGINT AS jumlah_komponen,
+                        COALESCE(SUM(hasil_rp), 0)::BIGINT AS total_anggaran_rp,
+                        STRING_AGG(DISTINCT NULLIF(sumber_dana, ''), ', ') AS sumber_dana,
+                        STRING_AGG(DISTINCT NULLIF(nama_subtitle, ''), '; ') AS daftar_subtitle
+                    FROM eb_scoped
+                    GROUP BY nama_opd, kode_sub_kegiatan, nama_sub_kegiatan
+                    ORDER BY total_anggaran_rp DESC
+                    """
+                ).to_arrow_table()
+                results.append(_write_iceberg_table(catalog, "gold.apbd_subkegiatan_summary", eb_sub, mode="overwrite"))
 
             # 3. Thematic priority mart
             tematik = con.sql(
@@ -816,16 +882,20 @@ def ingest_web_url(url: str) -> dict[str, Any]:
     title = (soup.title.string or "").strip() if soup.title else url
 
     links = []
+    base_url = str(resp.url)
     for a in soup.find_all("a", href=True):
-        href = str(a["href"]).strip()
+        raw_href = str(a["href"]).strip()
+        if not raw_href or raw_href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
         label = a.get_text(" ", strip=True)
-        if any(ext in href.lower() for ext in (".pdf", ".xlsx", ".xls", ".csv", "download", "rka")):
+        if any(ext in raw_href.lower() for ext in (".pdf", ".xlsx", ".xls", ".csv", "download", "rka")):
+            resolved_href = urljoin(base_url, raw_href)
             links.append(
                 {
                     "source_url": url,
                     "page_title": title,
                     "link_text": label[:240],
-                    "link_href": href[:500],
+                    "link_href": resolved_href[:500],
                     "sha256": sha256[:12],
                     "ingested_at": ingested_at,
                 }
@@ -932,6 +1002,11 @@ def get_catalog_summary() -> dict[str, Any]:
     return {"tables": tables_out, "snapshots": snapshots_out}
 
 
+def has_curated_data(tables: list[dict[str, Any]]) -> bool:
+    """True once any Silver or Gold table holds rows; raw Bronze data alone is not ready for analysis."""
+    return any(t["layer"] != "bronze" and t["rows"] > 0 for t in tables)
+
+
 def get_overview_data() -> dict[str, Any]:
     catalog = get_catalog()
     cat = get_catalog_summary()
@@ -972,6 +1047,7 @@ def get_overview_data() -> dict[str, Any]:
 
     return {
         "isEmpty": len(tables) == 0,
+        "readyForAnalysis": has_curated_data(tables),
         "totals": {
             "alokasiRp": total_alokasi,
             "realisasiRp": total_realisasi,
@@ -989,22 +1065,24 @@ def get_overview_data() -> dict[str, Any]:
 
 
 @contextmanager
-def _sql_sandbox(catalog: SqlCatalog):
-    """In-memory DuckDB with every Iceberg table as a view, no file/network access, and a time limit."""
+def _sql_sandbox(catalog: SqlCatalog, allowed_namespaces: tuple[str, ...] = NAMESPACES):
+    """In-memory DuckDB holding the allowed Iceberg namespaces, with no file/network access and a time limit.
+
+    Namespaces left out are never loaded, so no query can reach them.
+    """
     con = duckdb.connect()
     timer = threading.Timer(SQL_TIMEOUT_S, con.interrupt)
     try:
-        registered: list[str] = []
-        for ns in NAMESPACES:
+        for ns in allowed_namespaces:
             con.execute(f"CREATE SCHEMA IF NOT EXISTS {ns}")
             for _, tbl_name in catalog.list_tables(ns):
-                full_name = f"{ns}.{tbl_name}"
-                arrow = _read_table_arrow(catalog, full_name)
+                arrow = _read_table_arrow(catalog, f"{ns}.{tbl_name}")
                 if arrow is not None:
-                    alias = f"__tbl_{ns}_{tbl_name}"
-                    con.register(alias, arrow)
-                    con.execute(f'CREATE OR REPLACE VIEW {ns}."{tbl_name}" AS SELECT * FROM "{alias}"')
-                    registered.append(full_name)
+                    # A view over a registered Arrow table would expose its internal name in SHOW TABLES, so copy.
+                    # shortcut: copies every table per query (within memory_limit); cache if data reaches 100s of MB.
+                    con.register("_load", arrow)
+                    con.execute(f'CREATE TABLE {ns}."{tbl_name}" AS SELECT * FROM _load')
+                    con.unregister("_load")
         con.execute("SET memory_limit = '1GB'")
         con.execute("SET enable_external_access = false")
         timer.start()
@@ -1016,11 +1094,11 @@ def _sql_sandbox(catalog: SqlCatalog):
         con.close()
 
 
-def run_duckdb_sql(query: str) -> dict[str, Any]:
+def run_duckdb_sql(query: str, allowed_namespaces: tuple[str, ...] = NAMESPACES) -> dict[str, Any]:
     q = _validate_readonly_sql(query)
     catalog = get_catalog()
     t0 = time.perf_counter()
-    with _sql_sandbox(catalog) as con:
+    with _sql_sandbox(catalog, allowed_namespaces) as con:
         rel = con.execute(q)
         cols = [d[0] for d in rel.description] if rel.description else []
         raw_rows = rel.fetchmany(SQL_MAX_ROWS + 1)
@@ -1035,7 +1113,9 @@ def run_duckdb_sql(query: str) -> dict[str, Any]:
 
 
 def reset_warehouse() -> dict[str, Any]:
-    with _WAREHOUSE_LOCK:
+    from vector_store import _VECTOR_LOCK
+
+    with _WAREHOUSE_LOCK, _VECTOR_LOCK:
         if WAREHOUSE_DIR.exists():
             shutil.rmtree(WAREHOUSE_DIR)
         get_catalog()
@@ -1243,14 +1323,23 @@ def promote_bronze_to_silver(
             kode_std, internal_id = _parse_sub_kegiatan_id(r.get("id_sub_kegiatan_raw"))
             nama_sub_clean, nama_ppkm = _split_sub_kegiatan_ppkm(r.get("nama_sub_kegiatan_raw"))
             alokasi = _to_int(r.get("alokasi_rp")) or 0
+            penggunaan_dana = _to_int(r.get("penggunaan_dana_rp")) or 0
             sp2d = _to_int(r.get("sp2d_rp")) or 0
             renc_fisik = _to_float(r.get("rencana_fisik_pct")) or 0.0
             real_fisik = _parse_fisik_real(r.get("realisasi_fisik_pct"))
             dq_flags = []
-            if renc_fisik > 100.0 or real_fisik > 100.0:
+            # Excel col 12 (rencana_fisik_pct) is penggunaan_dana/alokasi*100, NOT physical progress;
+            # only col 15 (realisasi_fisik_pct) measures actual physical completion.
+            if real_fisik > 100.0:
                 dq_flags.append("FISIK_OVER_100")
-            if alokasi > 0 and sp2d > alokasi:
-                dq_flags.append("SP2D_OVER_ALOKASI")
+            # Many BLUD/multi-item packages keep a placeholder alokasi_rp (e.g. Rp 50 jt) while the
+            # real operational spending plan lives in penggunaan_dana_rp. True overbudget means SP2D
+            # exceeds BOTH alokasi_rp and penggunaan_dana_rp.
+            effective_ceiling = max(alokasi, penggunaan_dana)
+            if sp2d > 0 and sp2d > effective_ceiling:
+                dq_flags.append("OVERBUDGET")
+            elif penggunaan_dana > 0 and sp2d > penggunaan_dana:
+                dq_flags.append("SP2D_OVER_PENGGUNAAN_DANA")
             silver_rows.append(
                 {
                     "nama_opd": pd_name,
@@ -1262,8 +1351,9 @@ def promote_bronze_to_silver(
                     "nama_pekerjaan": str(r.get("nama_pakerjaan") or "").strip(),
                     "metode_pekerjaan": str(r.get("metode_pekerjaan") or "").strip(),
                     "alokasi_rp": alokasi,
-                    "penggunaan_dana_rp": _to_int(r.get("penggunaan_dana_rp")) or 0,
+                    "penggunaan_dana_rp": penggunaan_dana,
                     "rencana_fisik_pct": renc_fisik,
+                    "realisasi_fisik_pct": real_fisik,
                     "total_realisasi_rp": _to_int(r.get("total_realisasi_rp")) or 0,
                     "sp2d_rp": sp2d,
                     "rekanan": str(r.get("rekanan") or "").strip(),
@@ -1272,6 +1362,8 @@ def promote_bronze_to_silver(
                     "periode_laporan": str(r.get("_periode_raw") or ""),
                 }
             )
+        if not silver_rows:
+            raise ValueError(f"Tabel {source_table} tidak memiliki baris valid untuk dipromosikan.")
         target_id = target_table or "silver.monitoring_pekerjaan"
         silver_res = _write_iceberg_table(catalog, target_id, pa.Table.from_pylist(silver_rows), mode="overwrite")
 
@@ -1306,6 +1398,8 @@ def promote_bronze_to_silver(
                     "is_inflasi": _to_bool(r.get("is_inflasi")),
                 }
             )
+        if not silver_rows:
+            raise ValueError(f"Tabel {source_table} tidak memiliki baris valid untuk dipromosikan.")
         target_id = target_table or "silver.ebudgeting_rincian"
         silver_res = _write_iceberg_table(catalog, target_id, pa.Table.from_pylist(silver_rows), mode="overwrite")
 

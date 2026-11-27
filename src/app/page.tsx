@@ -34,22 +34,35 @@ const STARTER_PROMPTS = [
   },
 ];
 
-/** Lightweight safe formatter for assistant markdown (bold, inline code, bullet lists, tables). */
+function formatUrlLabel(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const lastSeg = parsed.pathname.split("/").pop() || "";
+    try {
+      return decodeURIComponent(lastSeg) || parsed.hostname;
+    } catch {
+      return lastSeg || parsed.hostname;
+    }
+  } catch {
+    return url;
+  }
+}
+
+/** Lightweight safe formatter for assistant markdown (bold, italic, inline code, links, lists, rules, tables). */
 function MessageBody({ text }: { text: string }) {
   const lines = text.split("\n");
   const blocks: React.ReactNode[] = [];
   let i = 0;
 
-  const renderInline = (line: string, keyPrefix: string) => {
+  const renderInline = (line: string, keyPrefix: string, depth = 0): React.ReactNode => {
     const parts = line.split(
-      /(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|<https?:\/\/[^\s>]+>|https?:\/\/[^\s<>|)]*[^\s<>|).,;:!?]|\*\*[^*]+\*\*|`[^`]+`|\*[^*\s](?:[^*]*[^*\s])?\*)/g
+      /(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|<https?:\/\/[^\s>]+>|https?:\/\/[^\s<>|)]*[^\s<>|).,;:!?]|\*\*(?:(?!\*\*).)+\*\*|`[^`]+`|\*[^*\s](?:[^*]*[^*\s])?\*)/g
     );
     return parts.map((part, idx) => {
       // Links: [label](url), <url> or a bare url. Only http(s) can match, so javascript: links never render.
       const md = part.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
       const url = md ? md[2] : part.match(/^<?(https?:\/\/[^\s>]+)>?$/)?.[1];
       if (url) {
-        const fileName = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
         return (
           <a
             key={`${keyPrefix}-${idx}`}
@@ -59,18 +72,19 @@ function MessageBody({ text }: { text: string }) {
             title={url}
             className="text-[var(--accent)] font-medium underline underline-offset-2 break-all hover:opacity-80"
           >
-            {md ? md[1] : fileName || new URL(url).hostname}
+            {md ? md[1] : formatUrlLabel(url)}
           </a>
         );
       }
-      if (part.startsWith("**") && part.endsWith("**")) {
+      if (part.length > 4 && part.startsWith("**") && part.endsWith("**")) {
+        const inner = part.slice(2, -2);
         return (
           <strong key={`${keyPrefix}-${idx}`} className="font-semibold text-[var(--text)]">
-            {part.slice(2, -2)}
+            {depth < 3 ? renderInline(inner, `${keyPrefix}-${idx}-b`, depth + 1) : inner}
           </strong>
         );
       }
-      if (part.startsWith("`") && part.endsWith("`")) {
+      if (part.length > 2 && part.startsWith("`") && part.endsWith("`")) {
         return (
           <code
             key={`${keyPrefix}-${idx}`}
@@ -81,7 +95,12 @@ function MessageBody({ text }: { text: string }) {
         );
       }
       if (part.length > 2 && part.startsWith("*") && part.endsWith("*")) {
-        return <em key={`${keyPrefix}-${idx}`}>{part.slice(1, -1)}</em>;
+        const inner = part.slice(1, -1);
+        return (
+          <em key={`${keyPrefix}-${idx}`}>
+            {depth < 3 ? renderInline(inner, `${keyPrefix}-${idx}-i`, depth + 1) : inner}
+          </em>
+        );
       }
       return <React.Fragment key={`${keyPrefix}-${idx}`}>{part}</React.Fragment>;
     });
@@ -160,6 +179,13 @@ function MessageBody({ text }: { text: string }) {
       continue;
     }
 
+    // Horizontal rule
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(line.trim())) {
+      blocks.push(<hr key={`hr-${i}`} className="my-3 border-0 border-t border-[var(--border)]" />);
+      i += 1;
+      continue;
+    }
+
     // Bullet list
     if (/^[-*•]\s+/.test(line.trim())) {
       const items: string[] = [];
@@ -177,17 +203,47 @@ function MessageBody({ text }: { text: string }) {
       continue;
     }
 
-    // Numbered list
+    // Numbered list (preserves start number and nests immediate sub-bullets under each item)
     if (/^\d+\.\s+/.test(line.trim())) {
-      const items: string[] = [];
+      const startMatch = line.trim().match(/^(\d+)\.\s+/);
+      const startNum = startMatch ? Number(startMatch[1]) : 1;
+      const items: { text: string; subBullets: string[] }[] = [];
       while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
-        items.push(lines[i].trim().replace(/^\d+\.\s+/, ""));
+        const text = lines[i].trim().replace(/^\d+\.\s+/, "");
         i += 1;
+        const subBullets: string[] = [];
+        while (i < lines.length) {
+          const rawNext = lines[i];
+          const trimmedNext = rawNext.trim();
+          if (/^[-*•]\s+/.test(trimmedNext)) {
+            subBullets.push(trimmedNext.replace(/^[-*•]\s+/, ""));
+            i += 1;
+          } else if (
+            !trimmedNext &&
+            i + 1 < lines.length &&
+            (/^\s+[-*•]\s+/.test(lines[i + 1]) || /^\d+\.\s+/.test(lines[i + 1].trim()))
+          ) {
+            i += 1;
+            if (/^\d+\.\s+/.test(lines[i].trim())) break;
+          } else {
+            break;
+          }
+        }
+        items.push({ text, subBullets });
       }
       blocks.push(
-        <ol key={`ol-${i}`} className="list-decimal pl-5 my-1.5 space-y-1">
+        <ol key={`ol-${i}`} start={startNum} className="list-decimal pl-5 my-1.5 space-y-1.5">
           {items.map((it, idx) => (
-            <li key={idx}>{renderInline(it, `oli-${i}-${idx}`)}</li>
+            <li key={idx}>
+              <span>{renderInline(it.text, `oli-${i}-${idx}`)}</span>
+              {it.subBullets.length > 0 && (
+                <ul className="list-disc pl-5 mt-1 space-y-0.5">
+                  {it.subBullets.map((sb, sbi) => (
+                    <li key={sbi}>{renderInline(sb, `olis-${i}-${idx}-${sbi}`)}</li>
+                  ))}
+                </ul>
+              )}
+            </li>
           ))}
         </ol>
       );

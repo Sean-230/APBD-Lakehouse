@@ -121,6 +121,9 @@ def _build_chunks_for_table(full_name: str, arrow: pa.Table) -> list[dict[str, s
 
     if full_name == "gold.apbd_subkegiatan_summary":
         for r in rows:
+            sp2d_part = (
+                f", SP2D {_fmt_rp(r.get('total_sp2d_rp'))}" if r.get("total_sp2d_rp") is not None else ""
+            )
             extra = (
                 f" Sumber dana: {r.get('sumber_dana')}." if r.get("sumber_dana") else ""
             ) + (
@@ -128,7 +131,7 @@ def _build_chunks_for_table(full_name: str, arrow: pa.Table) -> list[dict[str, s
             )
             txt = (
                 f"Sub Kegiatan {r.get('kode_sub_kegiatan', '')} ({r.get('nama_opd', '')}): "
-                f"{r.get('nama_sub_kegiatan', '')} — Total Anggaran {_fmt_rp(r.get('total_anggaran_rp'))}.{extra}"
+                f"{r.get('nama_sub_kegiatan', '')} — Total Anggaran {_fmt_rp(r.get('total_anggaran_rp'))}{sp2d_part}.{extra}"
             )
             out.append({"source": full_name, "layer": layer, "text": txt[:700]})
         return out
@@ -273,8 +276,11 @@ def index_table_to_vectors(full_name: str) -> dict[str, Any]:
         }
 
 
+EXCLUDED_AUTO_VECTOR_TABLES = {"gold.dq_anomaly_audit"}
+
+
 def rebuild_all_vectors() -> dict[str, Any]:
-    """Index ONLY Gold Iceberg tables into the local vector store."""
+    """Index ONLY curated Gold Iceberg tables into the local vector store."""
     with _VECTOR_LOCK:
         t0 = time.perf_counter()
         catalog = get_catalog()
@@ -284,6 +290,8 @@ def rebuild_all_vectors() -> dict[str, Any]:
 
         for _, tbl_name in catalog.list_tables("gold"):
             full_name = f"gold.{tbl_name}"
+            if full_name in EXCLUDED_AUTO_VECTOR_TABLES:
+                continue
             arrow = _read_table_arrow(catalog, full_name)
             if arrow is None or arrow.num_rows == 0:
                 continue
@@ -337,12 +345,12 @@ def search_vectors(query: str, top_k: int = 6) -> dict[str, Any]:
     flat = table.column("embedding").combine_chunks().flatten().to_numpy(zero_copy_only=False)
     mat = flat.reshape(table.num_rows, -1)
 
-    # Cosine similarity
+    # Normalized hybrid score in [0, 1]: cosine similarity + rare-word keyword boost
     q_norm = np.linalg.norm(q_vec) + 1e-10
     m_norms = np.linalg.norm(mat, axis=1) + 1e-10
-    scores = (mat @ q_vec) / (m_norms * q_norm) + KEYWORD_WEIGHT * _keyword_scores(
-        q, table.column("text").to_pylist()
-    )
+    cos = np.clip((mat @ q_vec) / (m_norms * q_norm), 0.0, 1.0)
+    kw = _keyword_scores(q, table.column("text").to_pylist())
+    scores = (cos + KEYWORD_WEIGHT * kw) / (1.0 + KEYWORD_WEIGHT)
 
     k = min(max(1, top_k), table.num_rows)
     top_idx = np.argsort(scores)[::-1][:k]

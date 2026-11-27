@@ -15,9 +15,8 @@ const plexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SuraLake — APBD Surabaya AI & Apache Iceberg Lakehouse",
-  description:
-    "Asisten AI (Gemini + DuckDB) dan Data Lakehouse APBD Kota Surabaya berbasis Apache Iceberg Medallion (Bronze, Silver, Gold).",
+  title: "SuraLake — Asisten APBD Kota Surabaya",
+  description: "Asisten AI untuk bertanya tentang APBD Kota Surabaya.",
 };
 
 export default function RootLayout({

@@ -8,7 +8,6 @@ import {
   Database,
   Loader2,
   Search,
-  Sparkles,
 } from "lucide-react";
 import {
   fetchVectorStats,
@@ -49,6 +48,7 @@ function getRelatedSet(tableName: string, allTables: CatalogTable[]): Set<string
       "bronze.monitoring_pd_raw",
       "silver.monitoring_pekerjaan",
       "gold.apbd_opd_summary",
+      "gold.apbd_subkegiatan_summary",
       "gold.dq_anomaly_audit",
     ],
     [
@@ -236,8 +236,7 @@ export function MedallionFlowCanvas({
   const renderNodeCard = (
     t: CatalogTable,
     actionLabel?: string,
-    onAction?: () => void,
-    canAlsoVector?: boolean
+    onAction?: () => void
   ) => {
     const isSelected = selectedName === t.name;
     const isRelated = related.has(t.name);
@@ -289,20 +288,6 @@ export function MedallionFlowCanvas({
             >
               <span>{actionLabel}</span>
               <ArrowRight className="w-3 h-3" />
-            </button>
-          )}
-          {canAlsoVector && (
-            <button
-              type="button"
-              disabled={busyAction || vectorBusy}
-              onClick={(e) => {
-                e.stopPropagation();
-                runVisualVectorIndex(t.name);
-              }}
-              className="inline-flex items-center gap-1 h-6 px-2 rounded border border-[#b7e4c7] bg-[#f2f8f6] text-[11px] font-medium text-[#125142] hover:bg-[#e3f2ed] disabled:opacity-50 cursor-pointer"
-            >
-              <Sparkles className="w-3 h-3" />
-              <span>Vector</span>
             </button>
           )}
         </div>
@@ -396,7 +381,7 @@ export function MedallionFlowCanvas({
           ) : (
             <div className="flex flex-col gap-2">
               {bronzeTables.map((t) =>
-                renderNodeCard(t, "Ke Silver", () => runVisualPromoteBronze(t.name), false)
+                renderNodeCard(t, "Ke Silver", () => runVisualPromoteBronze(t.name))
               )}
             </div>
           )}
@@ -426,7 +411,7 @@ export function MedallionFlowCanvas({
           ) : (
             <div className="flex flex-col gap-2">
               {silverTables.map((t) =>
-                renderNodeCard(t, "Ke Gold", () => runVisualPromoteSilver(t.name), false)
+                renderNodeCard(t, "Ke Gold", () => runVisualPromoteSilver(t.name))
               )}
             </div>
           )}
@@ -456,7 +441,7 @@ export function MedallionFlowCanvas({
           ) : (
             <div className="flex flex-col gap-2">
               {goldTables.map((t) =>
-                renderNodeCard(t, "Ke Vector", () => runVisualVectorIndex(t.name), false)
+                renderNodeCard(t, "Ke Vector", () => runVisualVectorIndex(t.name))
               )}
             </div>
           )}
